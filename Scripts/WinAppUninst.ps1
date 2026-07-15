@@ -157,7 +157,7 @@ if ($RemoveStagingFiles -and (Test-Path $StagingPath)) {
 # Wrap up
 # ---------------------------------------------------------------------------
 if (-not $provisioned -and -not $pkg) {
-    Write-Log "Nothing was removed -- Windows App was not present on this machine." 'WARN'
+    Write-Log "Nothing was uninstalled -- Windows App was not present on this machine." 'WARN'
     exit 4
 }
 
