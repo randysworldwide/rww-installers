@@ -14,7 +14,7 @@ Windows App is a Microsoft Store (MSIX) package. winget's `msstore` source needs
 
 Release assets (uploaded to this repo's Release, tag `Release`, not committed into the repo tree — binaries don't belong in git history):
 
-- `MicrosoftCorporationII.Windows365_2.0.1071.0_x64.Msix` (main package)
+- `MicrosoftCorporationII.Windows365_2.0.1247.0_x64.Msix` (main package)
 - `Microsoft.VCLibs.140.00_14.0.33519.0_x64.Appx` (dependency)
 - `Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.Appx` (dependency)
 
