@@ -46,8 +46,8 @@ Both scripts accept:
 
 ```powershell
 -Apps <'VSCode','Terminal'>   # default: both
--LogPath <string>             # default: C:\ProgramData\RPS\Logs\Install-DevTools.log
-                               #      or  C:\ProgramData\RPS\Logs\Uninstall-DevTools.log
+-LogPath <string>             # default: C:\ProgramData\Dev\Logs\Install-DevTools.log
+                               #      or  C:\ProgramData\Dev\Logs\Uninstall-DevTools.log
 ```
 
 ## Exit codes
@@ -77,7 +77,7 @@ It contains a small bootstrap wrapper that:
 1. Downloads the current version of the matching `.ps1` from the public
    `rww-installers` repo (`raw.githubusercontent.com`, no authentication
    needed since the repo is public).
-2. Saves it to `C:\ProgramData\RPS\Scripts\`.
+2. Saves it to `C:\ProgramData\Dev\Scripts\`.
 3. Runs it and propagates its exit code.
 
 Script step layout (both Install and Uninstall scripts follow this same
@@ -106,7 +106,7 @@ success (exit 0) both fall through step 4 as usual.
 - Windows Terminal's fallback path pulls the latest `.msixbundle` from
   `github.com/microsoft/terminal/releases/latest` dynamically — no version
   is hardcoded there either.
-- Local logs land at `C:\ProgramData\RPS\Logs\` on each target machine.
+- Local logs land at `C:\ProgramData\Dev\Logs\` on each target machine.
 - Because `rww-installers` is public, anyone can view these scripts. Don't
   commit anything sensitive (tokens, internal hostnames beyond what's already
   here, credentials) into this repo.
