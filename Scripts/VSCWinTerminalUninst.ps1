@@ -36,7 +36,7 @@ param(
     [ValidateSet('VSCode', 'Terminal')]
     [string[]]$Apps = @('VSCode', 'Terminal'),
 
-    [string]$LogPath = "$env:ProgramData\RPS\Logs\Uninstall-DevTools.log"
+    [string]$LogPath = "$env:ProgramData\Dev\Logs\Uninstall-DevTools.log"
 )
 
 $ErrorActionPreference = 'Stop'
