@@ -43,7 +43,7 @@ $DestDir     = "$env:ProgramData\Dev\WindowsApp"
 $ReleaseBase = 'https://github.com/randysworldwide/rww-installers/releases/download/Release'
 
 $Files = @(
-    @{ Name = 'MicrosoftCorporationII.Windows365_2.0.1071.0_x64.Msix' }
+    @{ Name = 'MicrosoftCorporationII.Windows365_2.0.1247.0_x64.Msix' }
     @{ Name = 'Microsoft.VCLibs.140.00_14.0.33519.0_x64.Appx' }
     @{ Name = 'Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.Appx' }
 )
@@ -130,7 +130,7 @@ if (-not $downloadOk) {
     exit 2
 }
 
-$mainPackage  = Join-Path $DestDir 'MicrosoftCorporationII.Windows365_2.0.1071.0_x64.Msix'
+$mainPackage  = Join-Path $DestDir 'MicrosoftCorporationII.Windows365_2.0.1247.0_x64.Msix'
 $dependencies = @(
     (Join-Path $DestDir 'Microsoft.VCLibs.140.00_14.0.33519.0_x64.Appx'),
     (Join-Path $DestDir 'Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.Appx')
