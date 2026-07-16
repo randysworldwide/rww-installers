@@ -88,10 +88,21 @@ pattern):
 2. Log Message → "VSCInst value: @VSCInst@"
 3. IF Variable Check → @VSCInst@ Contains "Nothing was installed"/"Nothing was uninstalled"
        → then goto :ESAF
-4. Exit Script
-5. Label :ESAF
-6. Exit Script (as failed)
+4. IF Variable Check → @VSCInst@ Contains "[ERROR]"
+       → then goto :ESAF
+5. Exit Script
+6. Label :ESAF
+7. Exit Script (as failed)
 ```
+
+Step 4 matters as much as step 3: without it, a genuine failure (download
+failure, winget failure, not-elevated, etc.) doesn't contain the "Nothing
+was..." skip phrase, so step 3's condition is false and execution falls
+through to the plain "Exit Script" in step 5 — which reports **success**
+regardless of what actually happened. The `[ERROR]` tag is used consistently
+by every real error line in both the bootstrap wrapper and the underlying
+`Write-Log` function, so checking for it catches download failures, install/
+uninstall failures, and any other genuine error in one place.
 
 This makes Automate report a **failure** specifically when the run did
 nothing (every app already present for install, or every app already absent
