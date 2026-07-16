@@ -72,17 +72,21 @@ Each Automate "Execute Script" step does not contain the full script body. It co
 2. Saves it to `C:\ProgramData\Dev\Scripts\`.
 3. Runs it and propagates its exit code.
 
+The wrapper code itself is kept as a reference copy at `Scripts/BootstrapperScripts/WinApp-Bootstrap-Install.ps1` and `Scripts/BootstrapperScripts/WinApp-Bootstrap-Uninstall.ps1` — see `BootstrapperScripts/README.md` for details on how those relate to the actual Automate Script Editor steps (short version: they are not run directly on target machines; Automate's Script Editor content is what actually runs, and these files are a version-controlled mirror of it).
+
 Script step layout (both Install and Uninstall scripts follow this same pattern):
 ```
 1. Execute Script (PowerShell) → store result in @WinAppInst@ / @WinAppUninst@
 2. Log Message → "WinAppInst value: @WinAppInst@"
 3. IF Variable Check → @WinAppInst@ Contains "Nothing was installed"/"Nothing was uninstalled"
        → then goto :ESAF
-4. Exit Script
-5. Label :ESAF
-6. Exit Script (as failed)
+4. IF Variable Check → @WinAppInst@ Contains "[ERROR]"
+       → then goto :ESAF
+5. Exit Script
+6. Label :ESAF
+7. Exit Script (as failed)
 ```
-This makes Automate report a failure specifically when the run did nothing (app already present for install, or app already absent for uninstall) — a genuine install/uninstall failure (exit 1) or a normal success (exit 0) both fall through step 4 as usual.
+Step 3 catches the "nothing to do" skip case (app already present for install, or already absent for uninstall). Step 4 catches genuine failures — bootstrap download errors and real install/uninstall errors both use the same `[ERROR]` tag (see the `Write-Log` function in both .ps1 files), so this one check covers both failure sources. Without step 4, a bootstrap-level failure (e.g. DNS resolution failing on a specific machine, blocking the raw.githubusercontent.com download) doesn't contain the skip phrase, falls through step 3's IF, and gets reported as a false Success — step 4 closes that gap. Only when neither IF matches does the run fall through to step 5 as a genuine, successful install/uninstall.
 
 Maintenance notes
 - This repo's main branch is fetched live on every script run — there is no version pinning on the .ps1 files themselves. Test changes before merging to main, since a bad commit immediately affects the next machine the script runs on.
