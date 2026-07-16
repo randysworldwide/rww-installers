@@ -72,7 +72,9 @@ Both scripts accept:
 ## Automate wiring
 
 Each Automate "Execute Script" step does **not** contain the full script body.
-It contains a small bootstrap wrapper that:
+It contains a small bootstrap wrapper (`VSCWinTerm-Bootstrap-Install.ps1` /
+`VSCWinTerm-Bootstrap-Uninstall.ps1`, kept in `Scripts/BootstrapperScripts/`)
+that:
 
 1. Downloads the current version of the matching `.ps1` from the public
    `rww-installers` repo (`raw.githubusercontent.com`, no authentication
