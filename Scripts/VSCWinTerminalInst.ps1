@@ -147,7 +147,7 @@ function Install-WithWinget {
         [string]$Scope = 'machine'
     )
     $argList = @(
-        'install', '--id', $PackageId, '-e', '--silent',
+        'install', '--id', $PackageId, '-e', '--silent', '--source', 'winget',
         '--accept-package-agreements', '--accept-source-agreements',
         '--disable-interactivity', '--scope', $Scope
     )
