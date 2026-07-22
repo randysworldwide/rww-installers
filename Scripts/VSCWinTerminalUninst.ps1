@@ -129,7 +129,7 @@ function Test-TerminalInstalled {
 function Uninstall-VSCodeViaWinget {
     param([Parameter(Mandatory)][string]$WingetPath)
     $argList = @(
-        'uninstall', '--id', 'Microsoft.VisualStudioCode', '-e', '--silent',
+        'uninstall', '--id', 'Microsoft.VisualStudioCode', '-e', '--silent', '--source', 'winget',
         '--accept-source-agreements', '--disable-interactivity'
     )
     Write-Log "Running: winget $($argList -join ' ')"
