@@ -15,7 +15,8 @@
 #   - Any photos still sitting in the shared local folder are moved back
 #     into that user's own Pictures\Camera Roll folder first, so nothing
 #     is lost, then the now-empty shared folder is removed
-#   - The stale desktop shortcut that pointed at the shared folder
+#   - The stale "Camera Roll" desktop shortcut and the "Camera.lnk"
+#     desktop shortcut, if either was created
 #
 # Does NOT remove:
 #   - Any photos already copied to the network share.
@@ -35,10 +36,10 @@ $scriptDir = "C:\ProgramData\Dev\CameraRoll"
 $localPath = "C:\Users\Public\Pictures\Camera Roll"
 $guid      = "{AB5FB87B-7CE2-4F83-915D-550846C9537B}"
 
-$tasks = @("SetCameraRoll", "CameraRoll-Sync-User", "CameraRoll-MapDrive", "CameraRoll-PinTaskbar")
+$tasks = @("SetCameraRoll", "CameraRoll-Sync-User", "CameraRoll-MapDrive", "CameraRoll-CameraShortcut")
 $files = @(
-    "SetCameraRoll.ps1", "SyncCameraRoll.ps1", "MapDriveUser.ps1", "PinCameraUser.ps1",
-    "SyncCameraRoll-Launcher.vbs", "MapDriveUser-Launcher.vbs", "PinCameraUser-Launcher.vbs"
+    "SetCameraRoll.ps1", "SyncCameraRoll.ps1", "MapDriveUser.ps1", "CameraShortcutUser.ps1",
+    "SyncCameraRoll-Launcher.vbs", "MapDriveUser-Launcher.vbs", "CameraShortcutUser-Launcher.vbs"
 )
 
 function Log($msg) {
@@ -165,7 +166,8 @@ try {
             Log "No shared folder found at $localPath - nothing to move."
         }
 
-        # Remove the stale desktop shortcut pointing at the shared folder
+        # Remove the stale desktop shortcut pointing at the shared folder,
+        # and the Camera app desktop shortcut, if either was created.
         if ($userProfile) {
             $desktopPath = Join-Path $userProfile "Desktop"
             if (Test-Path $desktopPath) {
@@ -178,6 +180,12 @@ try {
                 if ($staleShortcuts) {
                     $staleShortcuts | Remove-Item -Force
                     Log "Removed stale desktop shortcut(s): $($staleShortcuts.Name -join ', ')"
+                }
+
+                $cameraShortcut = Join-Path $desktopPath "Camera.lnk"
+                if (Test-Path $cameraShortcut) {
+                    Remove-Item -Path $cameraShortcut -Force
+                    Log "Removed Camera app desktop shortcut: $cameraShortcut"
                 }
             }
         }
