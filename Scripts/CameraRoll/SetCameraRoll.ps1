@@ -1,13 +1,18 @@
 # SetCameraRoll.ps1
 # Runs at user logon (via Task Scheduler, as SYSTEM).
 #
-# What it does:
+# Only runs its setup for AD (domain) accounts. Local accounts, such as
+# Administrator or any other machine-local login, are detected and skipped
+# entirely - nothing on this tablet is touched for those sessions.
+#
+# What it does (for AD accounts only):
 #   1. Redirects the Camera Roll folder to C:\Users\Public\Pictures\Camera Roll
 #   2. Creates a desktop shortcut to that folder (skips if one already points there)
-#   3. Maps a network drive to the Incoming Receipt Photos share (if not already mapped)
-#   4. Registers a per-user sync task that copies photos to the network every 5 minutes
+#   3. Pins the Camera app to the taskbar (best-effort - see notes at that step)
+#   4. Maps a network drive to the Incoming Receipt Photos share (if not already mapped)
+#   5. Registers a per-user sync task that copies photos to the network every 5 minutes
 #
-# The sync task (step 4) runs as the logged-in AD user so it has the right
+# The sync task (step 5) runs as the logged-in AD user so it has the right
 # network credentials. It is recreated at each logon to stay tied to the
 # current user.
 
@@ -36,6 +41,21 @@ try {
     }
 
     Log "Logged in user: $loggedInUser"
+
+    # ------------------------------------------------------------------
+    # AD-only check
+    #    $loggedInUser is formatted "<Domain>\<Username>". For a local
+    #    account, the domain portion equals this computer's own name
+    #    (e.g. "WSCA1WHS027\Administrator"). For an AD account it's the
+    #    NetBIOS domain (e.g. "RPSINC\jsmith"). Skip entirely for local
+    #    accounts - nothing below this point should run for them.
+    # ------------------------------------------------------------------
+    $domainPart = $loggedInUser.Split('\')[0]
+    if ($domainPart -ieq $env:COMPUTERNAME) {
+        Log "'$loggedInUser' is a local account (domain part matches this computer's name) - skipping Camera Roll setup. This deployment only applies to AD accounts."
+        exit
+    }
+    Log "Confirmed AD account (domain: $domainPart) - continuing."
 
     $sid = (New-Object System.Security.Principal.NTAccount($loggedInUser)).Translate(
         [System.Security.Principal.SecurityIdentifier]).Value
@@ -110,6 +130,75 @@ try {
         }
     } else {
         Log "Could not determine user profile path - skipping shortcut."
+    }
+
+    # ------------------------------------------------------------------
+    # 3. Pin Camera app to taskbar
+    #    Taskbar personalization is per-session, so this must run as the
+    #    interactive user rather than SYSTEM - same pattern used for the
+    #    drive mapping below: spawn a short-lived scheduled task that
+    #    executes in the logged-in user's own session.
+    #
+    #    IMPORTANT CAVEAT: Microsoft has progressively locked down
+    #    programmatic taskbar pinning since Windows 10 20H2, and there is
+    #    no officially supported command-line method for pinning an
+    #    already-existing user's taskbar at runtime. This uses the classic
+    #    Shell.Application COM "verb" approach, which still works on some
+    #    Windows 10 builds but may silently do nothing on others, and is
+    #    NOT reliable on Windows 11. Treat this as best-effort: it logs a
+    #    clear message either way, but verify on this tablet's actual
+    #    Windows build before assuming it will work fleet-wide. If it
+    #    doesn't work on your build, the supported alternative is a
+    #    taskbar layout XML applied via Group Policy, which only takes
+    #    effect for new user profiles rather than existing ones.
+    # ------------------------------------------------------------------
+    if ($userProfile) {
+        $pinTaskName   = "CameraRoll-PinTaskbar"
+        $pinScriptPath = "C:\ProgramData\Dev\CameraRoll\PinCameraUser.ps1"
+
+        @"
+`$logFile = 'C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log'
+function PLog(`$m) { "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$m" | Out-File `$logFile -Append }
+
+try {
+    `$shellApp    = New-Object -ComObject Shell.Application
+    `$appsFolder  = `$shellApp.Namespace('shell:AppsFolder')
+    `$cameraItem  = `$appsFolder.Items() | Where-Object { `$_.Name -eq 'Camera' }
+
+    if (-not `$cameraItem) {
+        PLog "Taskbar pin: could not locate 'Camera' in shell:AppsFolder - skipping."
+    } else {
+        `$pinVerb = `$cameraItem.Verbs() | Where-Object { (`$_.Name -replace '&','') -match 'Pin to taskbar' }
+        if (`$pinVerb) {
+            `$pinVerb.DoIt()
+            PLog "Taskbar pin: pin verb invoked for Camera app."
+        } else {
+            PLog "Taskbar pin: 'Pin to taskbar' verb not available on this Windows build (already pinned, or this build blocks scripted pinning) - Camera app was NOT pinned."
+        }
+    }
+} catch {
+    PLog "Taskbar pin: attempt failed - `$_"
+}
+"@ | Set-Content $pinScriptPath
+
+        $existingPinTask = Get-ScheduledTask -TaskName $pinTaskName -ErrorAction SilentlyContinue
+        if ($existingPinTask) {
+            Unregister-ScheduledTask -TaskName $pinTaskName -Confirm:$false
+        }
+
+        $pinAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$pinScriptPath`""
+        $pinTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
+        $pinPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
+        $pinSettings  = New-ScheduledTaskSettingsSet `
+                            -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+                            -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
+
+        Register-ScheduledTask -TaskName $pinTaskName -Action $pinAction -Trigger $pinTrigger `
+            -Principal $pinPrincipal -Settings $pinSettings -Force | Out-Null
+        Log "Registered taskbar pin task - will attempt to pin Camera app as $loggedInUser in 25 seconds. Check log for whether the pin verb was actually available."
+    } else {
+        Log "No user profile path available - skipping taskbar pin attempt."
     }
 
     # ------------------------------------------------------------------
