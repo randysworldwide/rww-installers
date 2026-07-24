@@ -15,6 +15,14 @@
 # The sync task (step 5) runs as the logged-in AD user so it has the right
 # network credentials. It is recreated at each logon to stay tied to the
 # current user.
+#
+# All three tasks that run in the interactive user's session (taskbar
+# pin, drive mapping, and the recurring sync) are launched via a small
+# VBScript wrapper rather than calling powershell.exe directly. This
+# avoids the brief console-window flash that occurs even with
+# -WindowStyle Hidden, since wscript.exe has no window of its own and
+# starts the child process with no window ever created in the first
+# place.
 
 $logFile      = "C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log"
 $localPath    = "C:\Users\Public\Pictures\Camera Roll"
@@ -181,13 +189,24 @@ try {
 }
 "@ | Set-Content $pinScriptPath
 
+        # VBS launcher - eliminates the console-flash that happens when
+        # launching powershell.exe directly, even with -WindowStyle
+        # Hidden. wscript.exe has no window of its own, and Shell.Run's
+        # hidden-style argument starts the child process with no window
+        # ever created in the first place.
+        $pinLauncherPath = "C:\ProgramData\Dev\CameraRoll\PinCameraUser-Launcher.vbs"
+        @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$pinScriptPath""", 0, False
+"@ | Set-Content $pinLauncherPath
+
         $existingPinTask = Get-ScheduledTask -TaskName $pinTaskName -ErrorAction SilentlyContinue
         if ($existingPinTask) {
             Unregister-ScheduledTask -TaskName $pinTaskName -Confirm:$false
         }
 
-        $pinAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$pinScriptPath`""
+        $pinAction    = New-ScheduledTaskAction -Execute "wscript.exe" `
+                            -Argument "`"$pinLauncherPath`""
         $pinTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
         $pinPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
         $pinSettings  = New-ScheduledTaskSettingsSet `
@@ -254,9 +273,16 @@ if (`$alreadyMapped) {
 }
 "@ | Set-Content $userScriptPath
 
+        # VBS launcher - same console-flash fix as the taskbar pin step above.
+        $mapLauncherPath = "C:\ProgramData\Dev\CameraRoll\MapDriveUser-Launcher.vbs"
+        @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$userScriptPath""", 0, False
+"@ | Set-Content $mapLauncherPath
+
         $mapTaskName = "CameraRoll-MapDrive"
-        $mapAction   = New-ScheduledTaskAction -Execute "powershell.exe" `
-                           -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$userScriptPath`""
+        $mapAction   = New-ScheduledTaskAction -Execute "wscript.exe" `
+                           -Argument "`"$mapLauncherPath`""
         $mapTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(20)
         $mapPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
         $mapSettings  = New-ScheduledTaskSettingsSet `
@@ -284,8 +310,17 @@ if (`$alreadyMapped) {
         Log "Removed previous sync task."
     }
 
-    $syncAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                         -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$syncScript`""
+    # VBS launcher - same console-flash fix as above. This is the task
+    # that fires every 2 minutes all day, so it's the one most worth
+    # eliminating the flash for.
+    $syncLauncherPath = "C:\ProgramData\Dev\CameraRoll\SyncCameraRoll-Launcher.vbs"
+    @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$syncScript""", 0, False
+"@ | Set-Content $syncLauncherPath
+
+    $syncAction    = New-ScheduledTaskAction -Execute "wscript.exe" `
+                         -Argument "`"$syncLauncherPath`""
     $syncTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
                          -RepetitionInterval (New-TimeSpan -Minutes 2) `
                          -RepetitionDuration (New-TimeSpan -Days 9999)
