@@ -1,14 +1,13 @@
 # SetCameraRoll.ps1
 # Runs at user logon (via Task Scheduler, as SYSTEM).
 #
-# Only runs its setup for AD (domain) accounts. Local accounts, such as
-# Administrator or any other machine-local login, are detected and skipped
-# entirely - nothing on this tablet is touched for those sessions.
+# Runs its setup for whoever is currently logged in, AD account or local
+# account alike (e.g. Administrator).
 #
-# What it does (for AD accounts only):
+# What it does:
 #   1. Redirects the Camera Roll folder to C:\Users\Public\Pictures\Camera Roll
 #   2. Creates a desktop shortcut to that folder (skips if one already points there)
-#   3. Pins the Camera app to the taskbar (best-effort - see notes at that step)
+#   3. Creates a desktop shortcut to the Camera app
 #   4. Maps a network drive to the Incoming Receipt Photos share (if not already mapped)
 #   5. Registers a per-user sync task that copies photos to the network every 5 minutes
 #
@@ -49,21 +48,6 @@ try {
     }
 
     Log "Logged in user: $loggedInUser"
-
-    # ------------------------------------------------------------------
-    # AD-only check
-    #    $loggedInUser is formatted "<Domain>\<Username>". For a local
-    #    account, the domain portion equals this computer's own name
-    #    (e.g. "WSCA1WHS027\Administrator"). For an AD account it's the
-    #    NetBIOS domain (e.g. "RPSINC\jsmith"). Skip entirely for local
-    #    accounts - nothing below this point should run for them.
-    # ------------------------------------------------------------------
-    $domainPart = $loggedInUser.Split('\')[0]
-    if ($domainPart -ieq $env:COMPUTERNAME) {
-        Log "'$loggedInUser' is a local account (domain part matches this computer's name) - skipping Camera Roll setup. This deployment only applies to AD accounts."
-        exit
-    }
-    Log "Confirmed AD account (domain: $domainPart) - continuing."
 
     $sid = (New-Object System.Security.Principal.NTAccount($loggedInUser)).Translate(
         [System.Security.Principal.SecurityIdentifier]).Value
@@ -141,83 +125,77 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 3. Pin Camera app to taskbar
-    #    Taskbar personalization is per-session, so this must run as the
-    #    interactive user rather than SYSTEM - same pattern used for the
-    #    drive mapping below: spawn a short-lived scheduled task that
-    #    executes in the logged-in user's own session.
+    # 3. Desktop shortcut to Camera app
+    #    Creates a "Camera.lnk" shortcut on the desktop pointing at the
+    #    Camera UWP app via explorer.exe shell:appsFolder\<AppID>. This
+    #    replaces an earlier attempt to pin Camera to the taskbar, which
+    #    Microsoft has locked down on modern Windows builds and proved
+    #    unreliable in testing. A shortcut created this way is a normal,
+    #    supported technique - it doesn't rely on any automation surface
+    #    Microsoft has blocked, so it should be far more consistent
+    #    across different Windows builds than the taskbar pin was.
     #
-    #    IMPORTANT CAVEAT: Microsoft has progressively locked down
-    #    programmatic taskbar pinning since Windows 10 20H2, and there is
-    #    no officially supported command-line method for pinning an
-    #    already-existing user's taskbar at runtime. This uses the classic
-    #    Shell.Application COM "verb" approach, which still works on some
-    #    Windows 10 builds but may silently do nothing on others, and is
-    #    NOT reliable on Windows 11. Treat this as best-effort: it logs a
-    #    clear message either way, but verify on this tablet's actual
-    #    Windows build before assuming it will work fleet-wide. If it
-    #    doesn't work on your build, the supported alternative is a
-    #    taskbar layout XML applied via Group Policy, which only takes
-    #    effect for new user profiles rather than existing ones.
+    #    Runs in the interactive user's session (same VBS-launcher
+    #    pattern used elsewhere in this script) since Get-StartApps only
+    #    reflects the correct results when run as that user, not SYSTEM.
     # ------------------------------------------------------------------
     if ($userProfile) {
-        $pinTaskName   = "CameraRoll-PinTaskbar"
-        $pinScriptPath = "C:\ProgramData\Dev\CameraRoll\PinCameraUser.ps1"
+        $camTaskName     = "CameraRoll-CameraShortcut"
+        $camScriptPath   = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser.ps1"
+        $camLauncherPath = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser-Launcher.vbs"
 
         @"
 `$logFile = 'C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log'
-function PLog(`$m) { "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$m" | Out-File `$logFile -Append }
+function CLog(`$m) { "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$m" | Out-File `$logFile -Append }
 
 try {
-    `$shellApp    = New-Object -ComObject Shell.Application
-    `$appsFolder  = `$shellApp.Namespace('shell:AppsFolder')
-    `$cameraItem  = `$appsFolder.Items() | Where-Object { `$_.Name -eq 'Camera' }
+    `$camApp = Get-StartApps | Where-Object { `$_.Name -eq 'Camera' } | Select-Object -First 1
 
-    if (-not `$cameraItem) {
-        PLog "Taskbar pin: could not locate 'Camera' in shell:AppsFolder - skipping."
+    if (-not `$camApp) {
+        CLog "Camera desktop shortcut: could not find 'Camera' via Get-StartApps - skipping. The Camera app may not be installed on this tablet."
     } else {
-        `$pinVerb = `$cameraItem.Verbs() | Where-Object { (`$_.Name -replace '&','') -match 'Pin to taskbar' }
-        if (`$pinVerb) {
-            `$pinVerb.DoIt()
-            PLog "Taskbar pin: pin verb invoked for Camera app."
+        `$desktopPath = [Environment]::GetFolderPath('Desktop')
+        `$lnkPath     = Join-Path `$desktopPath 'Camera.lnk'
+
+        if (Test-Path `$lnkPath) {
+            CLog "Camera desktop shortcut already exists: `$lnkPath"
         } else {
-            PLog "Taskbar pin: 'Pin to taskbar' verb not available on this Windows build (already pinned, or this build blocks scripted pinning) - Camera app was NOT pinned."
+            `$wsh  = New-Object -ComObject WScript.Shell
+            `$lnk  = `$wsh.CreateShortcut(`$lnkPath)
+            `$lnk.TargetPath  = "`$env:WINDIR\explorer.exe"
+            `$lnk.Arguments   = "shell:appsFolder\`$(`$camApp.AppID)"
+            `$lnk.Description = "Camera"
+            `$lnk.Save()
+            CLog "Created Camera desktop shortcut: `$lnkPath (AppID: `$(`$camApp.AppID))"
         }
     }
 } catch {
-    PLog "Taskbar pin: attempt failed - `$_"
+    CLog "Camera desktop shortcut: attempt failed - `$_"
 }
-"@ | Set-Content $pinScriptPath
+"@ | Set-Content $camScriptPath
 
-        # VBS launcher - eliminates the console-flash that happens when
-        # launching powershell.exe directly, even with -WindowStyle
-        # Hidden. wscript.exe has no window of its own, and Shell.Run's
-        # hidden-style argument starts the child process with no window
-        # ever created in the first place.
-        $pinLauncherPath = "C:\ProgramData\Dev\CameraRoll\PinCameraUser-Launcher.vbs"
         @"
 Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$pinScriptPath""", 0, False
-"@ | Set-Content $pinLauncherPath
+objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$camScriptPath""", 0, False
+"@ | Set-Content $camLauncherPath
 
-        $existingPinTask = Get-ScheduledTask -TaskName $pinTaskName -ErrorAction SilentlyContinue
-        if ($existingPinTask) {
-            Unregister-ScheduledTask -TaskName $pinTaskName -Confirm:$false
+        $existingCamTask = Get-ScheduledTask -TaskName $camTaskName -ErrorAction SilentlyContinue
+        if ($existingCamTask) {
+            Unregister-ScheduledTask -TaskName $camTaskName -Confirm:$false
         }
 
-        $pinAction    = New-ScheduledTaskAction -Execute "wscript.exe" `
-                            -Argument "`"$pinLauncherPath`""
-        $pinTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
-        $pinPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
-        $pinSettings  = New-ScheduledTaskSettingsSet `
+        $camAction    = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$camLauncherPath`""
+        $camTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
+        $camPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
+        $camSettings  = New-ScheduledTaskSettingsSet `
                             -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
                             -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
 
-        Register-ScheduledTask -TaskName $pinTaskName -Action $pinAction -Trigger $pinTrigger `
-            -Principal $pinPrincipal -Settings $pinSettings -Force | Out-Null
-        Log "Registered taskbar pin task - will attempt to pin Camera app as $loggedInUser in 25 seconds. Check log for whether the pin verb was actually available."
+        Register-ScheduledTask -TaskName $camTaskName -Action $camAction -Trigger $camTrigger `
+            -Principal $camPrincipal -Settings $camSettings -Force | Out-Null
+        Log "Registered Camera desktop shortcut task - will run as $loggedInUser in 25 seconds."
     } else {
-        Log "No user profile path available - skipping taskbar pin attempt."
+        Log "No user profile path available - skipping Camera desktop shortcut."
     }
 
     # ------------------------------------------------------------------
