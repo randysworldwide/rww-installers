@@ -36,7 +36,10 @@ $localPath = "C:\Users\Public\Pictures\Camera Roll"
 $guid      = "{AB5FB87B-7CE2-4F83-915D-550846C9537B}"
 
 $tasks = @("SetCameraRoll", "CameraRoll-Sync-User", "CameraRoll-MapDrive", "CameraRoll-PinTaskbar")
-$files = @("SetCameraRoll.ps1", "SyncCameraRoll.ps1", "MapDriveUser.ps1", "PinCameraUser.ps1")
+$files = @(
+    "SetCameraRoll.ps1", "SyncCameraRoll.ps1", "MapDriveUser.ps1", "PinCameraUser.ps1",
+    "SyncCameraRoll-Launcher.vbs", "MapDriveUser-Launcher.vbs", "PinCameraUser-Launcher.vbs"
+)
 
 function Log($msg) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
