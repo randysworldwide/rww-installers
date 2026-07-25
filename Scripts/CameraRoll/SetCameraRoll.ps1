@@ -7,23 +7,21 @@
 # What it does:
 #   1. Redirects the Camera Roll folder to C:\Users\Public\Pictures\Camera Roll
 #   2. Creates a desktop shortcut to that folder (skips if one already points there)
-#   3. Creates a desktop shortcut to the Camera app
-#   4. Maps a network drive to the Incoming Receipt Photos share (if not already mapped)
-#   5. Registers a per-user sync task that copies photos to the network every 5 minutes
+#   3. Maps a network drive to the Incoming Receipt Photos share (if not already mapped)
+#   4. Registers a per-user sync task that copies photos to the network every 5 minutes
 #
-# The sync task (step 5) runs as the logged-in AD user so it has the right
+# The sync task (step 4) runs as the logged-in AD user so it has the right
 # network credentials. It is recreated at each logon to stay tied to the
 # current user.
 #
-# All three tasks that run under the logged-in user's identity (Camera
-# app shortcut, drive mapping, and the recurring sync) use LogonType S4U
-# rather than Interactive. S4U runs the task under that user's identity
-# (so network authentication still works) without ever attaching to the
-# interactive desktop session - meaning no window is ever created, with
-# no need for -WindowStyle Hidden or any wrapper script. This also avoids
-# depending on Windows Script Host, which is commonly disabled by
-# endpoint security tools and silently blocks anything routed through
-# wscript.exe/cscript.exe.
+# Both tasks that run under the logged-in user's identity (drive mapping
+# and the recurring sync) use LogonType S4U rather than Interactive. S4U
+# runs the task under that user's identity (so network authentication
+# still works) without ever attaching to the interactive desktop session -
+# meaning no window is ever created, with no need for -WindowStyle Hidden
+# or any wrapper script. This also avoids depending on Windows Script
+# Host, which some endpoint security tools block, silently breaking
+# anything routed through wscript.exe/cscript.exe.
 
 $logFile      = "C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log"
 $localPath    = "C:\Users\Public\Pictures\Camera Roll"
@@ -127,76 +125,7 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 3. Desktop shortcut to Camera app
-    #    Creates a "Camera.lnk" shortcut on the desktop pointing at the
-    #    Camera UWP app via explorer.exe shell:appsFolder\<AppID>. This
-    #    replaces an earlier attempt to pin Camera to the taskbar, which
-    #    Microsoft has locked down on modern Windows builds and proved
-    #    unreliable in testing. A shortcut created this way is a normal,
-    #    supported technique - it doesn't rely on any automation surface
-    #    Microsoft has blocked, so it should be far more consistent
-    #    across different Windows builds than the taskbar pin was.
-    #
-    #    Runs under the logged-in user's identity via LogonType S4U (see
-    #    file header) since Get-StartApps only reflects the correct
-    #    results when run as that user, not SYSTEM.
-    # ------------------------------------------------------------------
-    if ($userProfile) {
-        $camTaskName   = "CameraRoll-CameraShortcut"
-        $camScriptPath = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser.ps1"
-
-        @"
-`$logFile = 'C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log'
-function CLog(`$m) { "`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - `$m" | Out-File `$logFile -Append }
-
-try {
-    `$camApp = Get-StartApps | Where-Object { `$_.Name -eq 'Camera' } | Select-Object -First 1
-
-    if (-not `$camApp) {
-        CLog "Camera desktop shortcut: could not find 'Camera' via Get-StartApps - skipping. The Camera app may not be installed on this tablet."
-    } else {
-        `$desktopPath = [Environment]::GetFolderPath('Desktop')
-        `$lnkPath     = Join-Path `$desktopPath 'Camera.lnk'
-
-        if (Test-Path `$lnkPath) {
-            CLog "Camera desktop shortcut already exists: `$lnkPath"
-        } else {
-            `$wsh  = New-Object -ComObject WScript.Shell
-            `$lnk  = `$wsh.CreateShortcut(`$lnkPath)
-            `$lnk.TargetPath  = "`$env:WINDIR\explorer.exe"
-            `$lnk.Arguments   = "shell:appsFolder\`$(`$camApp.AppID)"
-            `$lnk.Description = "Camera"
-            `$lnk.Save()
-            CLog "Created Camera desktop shortcut: `$lnkPath (AppID: `$(`$camApp.AppID))"
-        }
-    }
-} catch {
-    CLog "Camera desktop shortcut: attempt failed - `$_"
-}
-"@ | Set-Content $camScriptPath
-
-        $existingCamTask = Get-ScheduledTask -TaskName $camTaskName -ErrorAction SilentlyContinue
-        if ($existingCamTask) {
-            Unregister-ScheduledTask -TaskName $camTaskName -Confirm:$false
-        }
-
-        $camAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$camScriptPath`""
-        $camTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
-        $camPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType S4U -RunLevel Limited
-        $camSettings  = New-ScheduledTaskSettingsSet `
-                            -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
-                            -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
-
-        Register-ScheduledTask -TaskName $camTaskName -Action $camAction -Trigger $camTrigger `
-            -Principal $camPrincipal -Settings $camSettings -Force | Out-Null
-        Log "Registered Camera desktop shortcut task - will run as $loggedInUser in 25 seconds."
-    } else {
-        Log "No user profile path available - skipping Camera desktop shortcut."
-    }
-
-    # ------------------------------------------------------------------
-    # 4. Network drive mapping
+    # 3. Network drive mapping
     #    Check HKEY_USERS\<SID>\Network for an existing mapping to the
     #    target share. If none exists, spawn a one-time task as the
     #    logged-in user to run net use in their session.
@@ -263,7 +192,7 @@ if (`$alreadyMapped) {
     }
 
     # ------------------------------------------------------------------
-    # 5. Per-user sync task
+    # 4. Per-user sync task
     #    Runs SyncCameraRoll.ps1 as the logged-in user every 5 minutes.
     #    Uses the interactive session token so the user's network
     #    credentials are available to reach the share.
