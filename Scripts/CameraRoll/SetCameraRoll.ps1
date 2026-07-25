@@ -15,13 +15,15 @@
 # network credentials. It is recreated at each logon to stay tied to the
 # current user.
 #
-# All three tasks that run in the interactive user's session (taskbar
-# pin, drive mapping, and the recurring sync) are launched via a small
-# VBScript wrapper rather than calling powershell.exe directly. This
-# avoids the brief console-window flash that occurs even with
-# -WindowStyle Hidden, since wscript.exe has no window of its own and
-# starts the child process with no window ever created in the first
-# place.
+# All three tasks that run under the logged-in user's identity (Camera
+# app shortcut, drive mapping, and the recurring sync) use LogonType S4U
+# rather than Interactive. S4U runs the task under that user's identity
+# (so network authentication still works) without ever attaching to the
+# interactive desktop session - meaning no window is ever created, with
+# no need for -WindowStyle Hidden or any wrapper script. This also avoids
+# depending on Windows Script Host, which is commonly disabled by
+# endpoint security tools and silently blocks anything routed through
+# wscript.exe/cscript.exe.
 
 $logFile      = "C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log"
 $localPath    = "C:\Users\Public\Pictures\Camera Roll"
@@ -135,14 +137,13 @@ try {
     #    Microsoft has blocked, so it should be far more consistent
     #    across different Windows builds than the taskbar pin was.
     #
-    #    Runs in the interactive user's session (same VBS-launcher
-    #    pattern used elsewhere in this script) since Get-StartApps only
-    #    reflects the correct results when run as that user, not SYSTEM.
+    #    Runs under the logged-in user's identity via LogonType S4U (see
+    #    file header) since Get-StartApps only reflects the correct
+    #    results when run as that user, not SYSTEM.
     # ------------------------------------------------------------------
     if ($userProfile) {
-        $camTaskName     = "CameraRoll-CameraShortcut"
-        $camScriptPath   = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser.ps1"
-        $camLauncherPath = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser-Launcher.vbs"
+        $camTaskName   = "CameraRoll-CameraShortcut"
+        $camScriptPath = "C:\ProgramData\Dev\CameraRoll\CameraShortcutUser.ps1"
 
         @"
 `$logFile = 'C:\ProgramData\Dev\CameraRoll\SetCameraRoll.log'
@@ -174,19 +175,15 @@ try {
 }
 "@ | Set-Content $camScriptPath
 
-        @"
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$camScriptPath""", 0, False
-"@ | Set-Content $camLauncherPath
-
         $existingCamTask = Get-ScheduledTask -TaskName $camTaskName -ErrorAction SilentlyContinue
         if ($existingCamTask) {
             Unregister-ScheduledTask -TaskName $camTaskName -Confirm:$false
         }
 
-        $camAction    = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$camLauncherPath`""
+        $camAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$camScriptPath`""
         $camTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(25)
-        $camPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
+        $camPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType S4U -RunLevel Limited
         $camSettings  = New-ScheduledTaskSettingsSet `
                             -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
                             -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
@@ -251,18 +248,11 @@ if (`$alreadyMapped) {
 }
 "@ | Set-Content $userScriptPath
 
-        # VBS launcher - same console-flash fix as the taskbar pin step above.
-        $mapLauncherPath = "C:\ProgramData\Dev\CameraRoll\MapDriveUser-Launcher.vbs"
-        @"
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$userScriptPath""", 0, False
-"@ | Set-Content $mapLauncherPath
-
         $mapTaskName = "CameraRoll-MapDrive"
-        $mapAction   = New-ScheduledTaskAction -Execute "wscript.exe" `
-                           -Argument "`"$mapLauncherPath`""
+        $mapAction   = New-ScheduledTaskAction -Execute "powershell.exe" `
+                           -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$userScriptPath`""
         $mapTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(20)
-        $mapPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
+        $mapPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType S4U -RunLevel Limited
         $mapSettings  = New-ScheduledTaskSettingsSet `
                             -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
                             -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
@@ -288,21 +278,14 @@ objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$us
         Log "Removed previous sync task."
     }
 
-    # VBS launcher - same console-flash fix as above. This is the task
-    # that fires every 2 minutes all day, so it's the one most worth
-    # eliminating the flash for.
-    $syncLauncherPath = "C:\ProgramData\Dev\CameraRoll\SyncCameraRoll-Launcher.vbs"
-    @"
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -ExecutionPolicy Bypass -NonInteractive -File ""$syncScript""", 0, False
-"@ | Set-Content $syncLauncherPath
-
-    $syncAction    = New-ScheduledTaskAction -Execute "wscript.exe" `
-                         -Argument "`"$syncLauncherPath`""
+    # VBS launcher removed - see file header for why this task now uses
+    # LogonType S4U instead.
+    $syncAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                         -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$syncScript`""
     $syncTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
                          -RepetitionInterval (New-TimeSpan -Minutes 2) `
                          -RepetitionDuration (New-TimeSpan -Days 9999)
-    $syncPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType Interactive -RunLevel Limited
+    $syncPrincipal = New-ScheduledTaskPrincipal -UserId $loggedInUser -LogonType S4U -RunLevel Limited
     $syncSettings  = New-ScheduledTaskSettingsSet `
                          -ExecutionTimeLimit (New-TimeSpan -Minutes 4) `
                          -MultipleInstances IgnoreNew
