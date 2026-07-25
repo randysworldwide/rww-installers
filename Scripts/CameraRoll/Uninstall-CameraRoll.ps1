@@ -3,12 +3,14 @@
 #
 # Removes:
 #   - SetCameraRoll scheduled task (logon trigger, SYSTEM)
-#   - CameraRoll-Sync-User, CameraRoll-MapDrive, CameraRoll-PinTaskbar
+#   - CameraRoll-Sync-User, CameraRoll-MapDrive, CameraRoll-CameraShortcut
 #     scheduled tasks (per-user / one-time helper tasks, in case any are
-#     still present when this runs)
-#   - SetCameraRoll.ps1, SyncCameraRoll.ps1, and the two dynamically
-#     generated per-user helper scripts (MapDriveUser.ps1,
-#     PinCameraUser.ps1) from C:\ProgramData\Dev\CameraRoll
+#     still present when this runs). The Camera Roll app shortcut feature
+#     was discontinued, but its task/files are still listed here for
+#     cleanup on any tablet that already had it installed.
+#   - SetCameraRoll.ps1, SyncCameraRoll.ps1, and the dynamically generated
+#     per-user helper scripts and VBS launchers from
+#     C:\ProgramData\Dev\CameraRoll
 #   - The registry redirection that pointed Camera Roll at the shared
 #     local folder, restoring it to %USERPROFILE%\Pictures\Camera Roll
 #     for the CURRENTLY LOGGED-IN user
