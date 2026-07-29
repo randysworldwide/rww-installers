@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<AnyConnectProfile xmlns="http://schemas.xmlsoap.org/encoding/"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://schemas.xmlsoap.org/encoding/ AnyConnectProfile.xsd">
+  <ClientInitialization>
+    <UseStartBeforeLogon UserControllable="false">false</UseStartBeforeLogon>
+    <AutomaticCertSelection UserControllable="false">true</AutomaticCertSelection>
+    <ShowPreConnectMessage>false</ShowPreConnectMessage>
+    <CertificateStore>All</CertificateStore>
+    <CertificateStoreOverride>false</CertificateStoreOverride>
+    <ProxySettings>Native</ProxySettings>
+    <AllowLocalProxyConnections>true</AllowLocalProxyConnections>
+    <AuthenticationTimeout>120</AuthenticationTimeout>
+    <AutoConnectOnStart UserControllable="false">false</AutoConnectOnStart>
+    <MinimizeOnConnect UserControllable="true">true</MinimizeOnConnect>
+    <LocalLanAccess UserControllable="false">false</LocalLanAccess>
+    <DisableCaptivePortalDetection UserControllable="false">false</DisableCaptivePortalDetection>
+    <ClearSmartcardPin UserControllable="true">true</ClearSmartcardPin>
+    <IPProtocolSupport>IPv4,IPv6</IPProtocolSupport>
+    <AutoReconnect UserControllable="false">true</AutoReconnect>
+    <AutoReconnectBehavior UserControllable="false">ReconnectAfterResume</AutoReconnectBehavior>
+    <AutoUpdate UserControllable="false">false</AutoUpdate>
+    <RSASecurIDIntegration UserControllable="false">Automatic</RSASecurIDIntegration>
+    <WindowsLogonEnforcement>SingleLocalLogon</WindowsLogonEnforcement>
+    <WindowsVPNEstablishment>LocalUsersOnly</WindowsVPNEstablishment>
+    <AutomaticVPNPolicy>false</AutomaticVPNPolicy>
+    <PPPExclusion UserControllable="false">Automatic</PPPExclusion>
+    <EnableScripting UserControllable="false">false</EnableScripting>
+    <EnableAutomaticServerSelection UserControllable="false">false</EnableAutomaticServerSelection>
+    <RetainVpnOnLogoff>false</RetainVpnOnLogoff>
+    <UseExternalBrowser>true</UseExternalBrowser>
+  </ClientInitialization>
+  <ServerList>
+    <HostEntry>
+      <HostName>RANDYS Worldwide VPN</HostName>
+      <HostAddress>dkp0nbcgb-vpdzbvmkdbnc.dynamic-m.com</HostAddress>
+      <PrimaryProtocol>SSL</PrimaryProtocol>
+    </HostEntry>
+    <HostEntry>
+      <HostName>RANDYS Worldwide VPN (remote.randysww.com)</HostName>
+      <HostAddress>remote.randysww.com</HostAddress>
+      <PrimaryProtocol>SSL</PrimaryProtocol>
+    </HostEntry>
+  </ServerList>
+</AnyConnectProfile>
