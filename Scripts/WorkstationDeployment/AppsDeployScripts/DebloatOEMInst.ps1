@@ -421,17 +421,18 @@ foreach ($t in $targets) {
         if (-not $appxResult.Ok) { $anyFailed = $true }
     }
 
-    if ($appxResult.Found) {
-        Write-Log "Removed via Appx -- skipping the registry-based fallback for this one."
-    } else {
-        # Either not Appx-packaged at all, or the Appx check found
-        # nothing -- fall back to the registry approach.
-        $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
-        if (-not $ok) { $anyFailed = $true }
-    }
+    # CONFIRMED IN TESTING: some Dell apps (Watchdog Timer specifically)
+    # have TWO independent components -- an Appx-packaged UI piece and a
+    # completely separate legacy InstallShield service/driver entry. An
+    # earlier version of this skipped the registry check entirely
+    # whenever Appx found something, which meant the Appx piece got
+    # removed but the separate legacy entry never even got attempted.
+    # Always try both now, regardless of what the other one found.
+    $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
+    if (-not $ok) { $anyFailed = $true }
 
     if (Test-TargetStillPresent -NamePatterns $t.NamePatterns -AppxSubstrings $t.AppxSubstrings) {
-        Write-Log "STILL PRESENT after the removal attempt above -- treating as a failure despite the uninstall command completing without an error." 'ERROR'
+        Write-Log "STILL PRESENT after the removal attempt(s) above -- treating as a failure despite the uninstall command(s) completing without an error." 'ERROR'
         $anyFailed = $true
     } else {
         Write-Log "Confirmed gone."
