@@ -324,6 +324,12 @@ $script:AppManifest = @(
     @{ Name = 'Power Settings (On Battery)';      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerOnBatteryInst.ps1'
        Note = "Screen off after 10 min, sleep after 20 min, while on battery. Harmless (and irrelevant) on a desktop with no battery." }
+    @{ Name = 'Remove Throwaway Setup Account';   Category = 'Finishing Touches'; DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/RemoveThrowawayAccountInst.ps1'
+       Note = "Defaults OFF, same as Reboot Computer -- account deletion is consequential enough to require a deliberate click. Schedules removal for the next startup instead of deleting immediately (can't delete the account running this script)." }
+    # CRITICAL ORDERING: must come after Remove Throwaway Setup Account
+    # (the actual removal happens post-reboot, so this needs to fire
+    # after that scheduling step, not before it).
     @{ Name = 'Reboot Computer';                  Category = 'Finishing Touches'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/RebootInst.ps1'
        Note = "Defaults OFF on purpose -- a reboot is consequential enough that it shouldn't happen without a deliberate click. Restarts ~20 seconds after this run finishes, giving time for the summary to render." }
