@@ -1,11 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Schedules removal of the throwaway local account used to get through
-    Windows OOBE (Microsoft no longer allows fully bypassing OOBE, so a
-    disposable local admin account -- typically named "Setup" -- gets
-    created just to reach a usable desktop). Designed to run elevated
-    (RWW WorkstationDeployment project -- see Apps-Deploy-Menu.ps1).
+    Disables auto-logon (if configured) and schedules removal of the
+    throwaway local account used to get through Windows OOBE, including
+    its C:\Users profile folder. Designed to run elevated (RWW
+    WorkstationDeployment project -- see Apps-Deploy-Menu.ps1).
 
 .DESCRIPTION
     Repo: randysworldwide/rww-installers
@@ -15,37 +14,60 @@
     exact account currently running this script -- Windows will not let
     you delete an account that's actively logged in with running
     processes. Instead, this schedules the actual deletion for the NEXT
-    startup (before any interactive logon), via a one-time SYSTEM-context
-    Scheduled Task that self-removes once it succeeds.
+    startup, via a one-time SYSTEM-context Scheduled Task that self-
+    removes once BOTH the account and its profile folder are confirmed
+    gone.
+
+    CONFIRMED IN TESTING -- ROOT CAUSE OF A REAL BUG, NOW FIXED: on a
+    machine with AutoAdminLogon configured (common on Dell OOBE-
+    provisioned accounts), Windows logs straight back into the throwaway
+    account almost immediately at boot -- before Task Scheduler's own
+    engine has finished starting, racing ahead of this task's "at
+    startup" trigger. Windows will still let the SAM account get deleted
+    while that session is active (the session just keeps running until
+    logout), but the PROFILE FOLDER removal specifically checks whether
+    the profile is currently loaded and skips if so -- so the account
+    vanished but C:\Users\<account> was left behind, and because the
+    original cleanup script only checked "is the account gone" before
+    self-unregistering (not "is the folder also gone"), the task deleted
+    itself after that one partial pass, leaving no way to retry.
+    Fixed two ways:
+      1. This script now disables AutoAdminLogon (and clears
+         DefaultPassword, which is often sitting in the registry in
+         PLAINTEXT under this setting -- worth clearing on its own
+         merits, not just for this race) if it's configured for the
+         target account, before ever scheduling anything. Removing the
+         race at its source means the normal logon screen shows on next
+         boot instead, giving Task Scheduler time to run before anyone
+         (human or auto-logon) claims the account.
+      2. The cleanup task now tracks account removal and folder removal
+         as two SEPARATE outcomes, and only self-unregisters once BOTH
+         are true -- a partial success (account gone, folder still
+         there) now correctly keeps retrying on subsequent boots instead
+         of silently giving up.
 
     Steps this script performs NOW (pre-reboot):
       1. Determine the target account -- defaults to whichever account is
          currently running this script ($env:USERNAME), NOT a hardcoded
-         "Setup" string -- self-documenting and avoids a fragile naming
-         assumption if the OOBE account convention ever changes.
+         "Setup" string.
       2. SAFETY GUARDS before touching anything:
          - Refuses to target a denylisted well-known account name
            (Administrator, SYSTEM, DefaultAccount, Guest,
            WDAGUtilityAccount) regardless of what was detected.
-         - Confirms the target is a genuine LOCAL account (Get-LocalUser
-           succeeds). Refuses to proceed if it can't confirm that --
-           specifically so this can never target a domain account if the
-           machine got domain-joined earlier in the same deployment run.
-      3. Writes a small cleanup script to
+         - If the account still exists, confirms it's a genuine LOCAL
+           account (Get-LocalUser succeeds) -- refuses to proceed
+           otherwise, so this can never target a domain account.
+      3. Checks AutoAdminLogon (see above) and disables it if it points
+         at the target account.
+      4. Proceeds if EITHER the account OR its C:\Users profile folder
+         still exists (not just the account -- otherwise a machine where
+         the account is already gone but the folder is still sitting
+         there, like the one that prompted this fix, would report
+         "nothing to do" and never clean up the folder).
+      5. Writes a small cleanup script to
          C:\ProgramData\Dev\AppsDeploy\RemoveSetupAccount\Cleanup-SetupAccount.ps1
-      4. Registers a Scheduled Task ("RWW-RemoveSetupAccount") that runs
-         that cleanup script as SYSTEM, triggered "at startup" (before any
-         user logs in), one-time. The task self-unregisters once the
-         account is confirmed removed; if removal fails for any reason
-         (e.g. the profile still shows as loaded), it stays registered to
-         retry on the next startup too.
-
-    KNOWN EDGE CASE NOT SPECIFICALLY HANDLED: if this machine has
-    AutoAdminLogon configured to automatically re-log-in as the throwaway
-    account after restart, there's a theoretical race between that logon
-    and this task's "at startup" trigger. Untested -- flagging rather than
-    guessing at a fix, since this depends on whether OOBE machines here
-    actually have auto-logon configured.
+      6. Registers a Scheduled Task ("RWW-RemoveSetupAccount") that runs
+         that cleanup script as SYSTEM, triggered "at startup", one-time.
 
     ORDERING: must run before Reboot Computer -- the actual removal only
     happens after that reboot. Positioned as the second-to-last entry in
@@ -65,7 +87,7 @@
     1 = failed to write the cleanup script or register the scheduled task
     2 = refused -- target account is denylisted or not confirmed local
     3 = not running elevated
-    4 = nothing to do -- target account doesn't exist (already removed)
+    4 = nothing to do -- neither the account nor its profile folder exist
 #>
 
 [CmdletBinding()]
@@ -80,6 +102,7 @@ $DenylistedAccounts = @('Administrator', 'SYSTEM', 'DefaultAccount', 'Guest', 'W
 $CleanupDir    = "$env:ProgramData\Dev\AppsDeploy\RemoveSetupAccount"
 $CleanupScript = Join-Path $CleanupDir 'Cleanup-SetupAccount.ps1'
 $TaskName      = 'RWW-RemoveSetupAccount'
+$WinlogonKey   = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -115,13 +138,39 @@ if ($DenylistedAccounts -contains $TargetAccount) {
     exit 2
 }
 
-$localUser = Get-LocalUser -Name $TargetAccount -ErrorAction SilentlyContinue
-if (-not $localUser) {
-    Write-Log "No local account named '$TargetAccount' exists -- nothing to schedule (already removed, or was never a local account)." 'WARN'
+# --- Disable AutoAdminLogon if it points at the target account, so the
+# normal logon screen shows next boot instead of racing our cleanup task. ---
+try {
+    $winlogon = Get-ItemProperty -Path $WinlogonKey -ErrorAction SilentlyContinue
+    if ($winlogon -and $winlogon.AutoAdminLogon -eq '1' -and $winlogon.DefaultUserName -eq $TargetAccount) {
+        Write-Log "AutoAdminLogon is configured for '$TargetAccount' -- this is what caused an immediate silent re-login last time. Disabling it." 'WARN'
+        Set-ItemProperty -Path $WinlogonKey -Name 'AutoAdminLogon' -Value '0' -ErrorAction Stop
+        if ($winlogon.PSObject.Properties.Name -contains 'DefaultPassword') {
+            Remove-ItemProperty -Path $WinlogonKey -Name 'DefaultPassword' -ErrorAction SilentlyContinue
+            Write-Log "Also cleared DefaultPassword -- auto-logon passwords are stored in that registry value in PLAINTEXT, worth removing regardless." 'WARN'
+        }
+        Write-Log "AutoAdminLogon disabled. The normal logon screen will show on next boot."
+    } else {
+        Write-Log "AutoAdminLogon is not configured for '$TargetAccount' -- nothing to disable there."
+    }
+} catch {
+    Write-Log "Could not check/disable AutoAdminLogon: $($_.Exception.Message)" 'WARN'
+}
+
+$localUser   = Get-LocalUser -Name $TargetAccount -ErrorAction SilentlyContinue
+$folderPath  = "C:\Users\$TargetAccount"
+$folderExists = Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue
+
+if (-not $localUser -and -not $folderExists) {
+    Write-Log "No local account and no leftover profile folder for '$TargetAccount' -- nothing to schedule." 'WARN'
     exit 4
 }
 
-Write-Log "Confirmed '$TargetAccount' is a genuine local account (SID: $($localUser.SID))."
+if ($localUser) {
+    Write-Log "Confirmed '$TargetAccount' is a genuine local account (SID: $($localUser.SID))."
+} else {
+    Write-Log "No local account named '$TargetAccount' (already removed), but a leftover profile folder still exists at $folderPath. Scheduling folder cleanup." 'WARN'
+}
 
 try {
     if (-not (Test-Path $CleanupDir)) { New-Item -Path $CleanupDir -ItemType Directory -Force | Out-Null }
@@ -146,47 +195,73 @@ function Write-CleanupLog {
 
 Write-CleanupLog "=== Post-reboot cleanup starting for account '$TargetAccount' ==="
 
-try {
-    $prof = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalPath -like "*\$TargetAccount" }
-    if ($prof) {
-        if ($prof.Loaded) {
-            Write-CleanupLog "Profile for $TargetAccount still shows as loaded -- skipping profile removal this pass, will retry next startup." 'WARN'
-        } else {
-            Remove-CimInstance -InputObject $prof -ErrorAction Stop
-            Write-CleanupLog "Removed user profile for $TargetAccount."
-        }
-    } else {
-        Write-CleanupLog "No profile found for $TargetAccount (already removed, or never fully created)." 'WARN'
-    }
-} catch {
-    Write-CleanupLog "Failed to remove profile: $($_.Exception.Message)" 'ERROR'
-}
-
 $accountRemoved = $false
 try {
     $u = Get-LocalUser -Name $TargetAccount -ErrorAction SilentlyContinue
     if ($u) {
         Remove-LocalUser -Name $TargetAccount -ErrorAction Stop
         Write-CleanupLog "Removed local account $TargetAccount."
-        $accountRemoved = $true
     } else {
         Write-CleanupLog "Local account $TargetAccount not found (already removed)." 'WARN'
-        $accountRemoved = $true
     }
+    $accountRemoved = $true
 } catch {
     Write-CleanupLog "Failed to remove local account: $($_.Exception.Message)" 'ERROR'
 }
 
-if ($accountRemoved) {
+# Profile removal is tracked SEPARATELY from account removal -- a machine
+# where the account got deleted while its profile was still marked
+# "loaded" (the AutoAdminLogon race this whole script exists to prevent,
+# but tracked independently as defense in depth) needs this to keep
+# retrying even though the account itself is already gone.
+$profileRemoved = $false
+try {
+    $prof = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPath -like "*\$TargetAccount" }
+    if ($prof) {
+        if ($prof.Loaded) {
+            Write-CleanupLog "Profile for $TargetAccount still shows as loaded -- skipping WMI profile removal this pass, will retry next startup." 'WARN'
+        } else {
+            Remove-CimInstance -InputObject $prof -ErrorAction Stop
+            Write-CleanupLog "Removed user profile (WMI) for $TargetAccount."
+        }
+    } else {
+        Write-CleanupLog "No WMI profile entry found for $TargetAccount (already removed, or never fully created)." 'WARN'
+    }
+} catch {
+    Write-CleanupLog "WMI profile removal failed: $($_.Exception.Message)" 'ERROR'
+}
+
+# Explicit folder deletion, regardless of how the WMI removal above went --
+# this is the actual fix for the leftover C:\Users\<account> folder: WMI
+# profile removal can succeed at the registry-hive level while still
+# leaving files behind in some cases, and it's skipped entirely whenever
+# the profile shows as loaded. Force-deleting the folder directly is the
+# reliable fallback either way.
+$folderPath = "C:\Users\$TargetAccount"
+if (Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue) {
     try {
-        Unregister-ScheduledTask -TaskName 'RWW-RemoveSetupAccount' -Confirm:$false -ErrorAction Stop
-        Write-CleanupLog "Self-unregistered the scheduled task -- cleanup complete."
+        Remove-Item -LiteralPath $folderPath -Recurse -Force -ErrorAction Stop
+        Write-CleanupLog "Force-deleted profile folder $folderPath."
+        $profileRemoved = $true
     } catch {
-        Write-CleanupLog "Account removed, but failed to unregister the scheduled task: $($_.Exception.Message)" 'WARN'
+        Write-CleanupLog "Failed to force-delete ${folderPath}: $($_.Exception.Message)" 'ERROR'
+        $profileRemoved = $false
     }
 } else {
-    Write-CleanupLog "Account removal did not succeed -- leaving the scheduled task in place to retry on the next startup." 'WARN'
+    Write-CleanupLog "$folderPath does not exist -- nothing to delete."
+    $profileRemoved = $true
+}
+
+if ($accountRemoved -and $profileRemoved) {
+    try {
+        Unregister-ScheduledTask -TaskName 'RWW-RemoveSetupAccount' -Confirm:$false -ErrorAction Stop
+        Write-CleanupLog "Self-unregistered the scheduled task -- cleanup complete (account and folder both confirmed gone)."
+    } catch {
+        Write-CleanupLog "Account and folder both removed, but failed to unregister the scheduled task: $($_.Exception.Message)" 'WARN'
+    }
+} else {
+    Write-CleanupLog "Leaving the scheduled task in place to retry on the next startup (account removed: $accountRemoved, folder removed: $profileRemoved)." 'WARN'
 }
 
 Write-CleanupLog "=== Post-reboot cleanup finished ==="
@@ -209,7 +284,7 @@ try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
 
-    Write-Log "Registered scheduled task '$TaskName' to remove '$TargetAccount' at next startup."
+    Write-Log "Registered scheduled task '$TaskName' to remove '$TargetAccount' (account and profile folder) at next startup."
 } catch {
     Write-Log "Failed to register the scheduled task: $($_.Exception.Message)" 'ERROR'
     exit 1
