@@ -1,0 +1,983 @@
+<#
+.SYNOPSIS
+    GUI menu for deploying the standard RWW application set to a machine.
+    Meant to be run from the USB deployment stick or the network deployment
+    share, on a machine that already has a qualifying OEM Windows image on it.
+
+.DESCRIPTION
+    Repo: randysworldwide/rww-installers
+    Path: Scripts/WorkstationDeployment/Apps-Deploy-Menu.ps1
+
+    This is a standalone project, separate from the older ConnectWise Automate
+    scripting under Scripts/ (VSCWinTerminalInst.ps1, the BootstrapperScripts
+    folder, etc). Those are left alone for now and may be revisited later.
+
+    TWO-STAGE GUI:
+      1. Selection screen -- categorized checkboxes, hover tooltips (see
+         Show-SelectionGui). Same as before.
+      2. Progress screen -- after clicking "Install Selected", shows a
+         per-app marquee progress bar (fills solid briefly when that app is
+         confirmed done, then resets to marquee for the next one), an
+         overall "app N of Total" progress bar, and a live scrolling text
+         log of what each script is doing (see Show-ProgressGui).
+
+    HONESTY NOTE on the per-app bar: winget/msiexec don't expose real
+    install percentage without a lot of extra plumbing to parse their live
+    output byte-by-byte, which none of these scripts currently do. The
+    per-app bar is therefore an INDETERMINATE marquee while installing, not
+    a true percentage -- it fills solid the instant the app is confirmed
+    installed (success or failure), then resets for the next one. This is
+    an honest visual of "working / done", not a fabricated percentage.
+
+    ARCHITECTURE NOTE on live log capture: every install script logs via
+    [Console]::WriteLine rather than PowerShell's normal output stream
+    (deliberately, so Write-Log calls can never leak into a function's
+    return value). To surface that output in the GUI, every script under
+    AppsDeployScripts now checks for a $Global:RWWLogSink callback first
+    and only falls back to Console::WriteLine if none is registered --
+    so they still work fine run standalone/manually outside this menu.
+    The actual install loop runs on a background PowerShell runspace (so
+    the GUI doesn't freeze during a blocking msiexec/winget call); that
+    runspace sets $Global:RWWLogSink to push lines into a thread-safe
+    queue that the GUI's timer drains into the log textbox.
+
+    This script does NOT contain install logic itself. Each app in $script:AppManifest
+    points at either:
+      - a script already in this repo, downloaded fresh from GitHub at
+        runtime (so a machine always gets the current version, not a stale
+        copy on a USB stick), or
+      - nothing yet (Status = 'Placeholder') -- these show in the GUI,
+        greyed out and unselectable, so the list stays complete without
+        letting anyone pick something that won't do anything.
+
+    Per-app install scripts for this project live under
+    Scripts/WorkstationDeployment/AppsDeployScripts/. WinAppInst.ps1 is a
+    copy of the version used by the older Automate deployment path (still at
+    Scripts/WinAppInst.ps1) rather than a shared reference to it -- the two
+    may drift over time until a decision is made about the old Automate
+    scripting.
+
+    Local folder convention on the target machine:
+      - C:\ProgramData\Dev\AppsDeploy\               downloaded scripts (this menu's own cache)
+      - C:\ProgramData\Dev\AppsDeploy\Logs\           every script's log file
+      - C:\ProgramData\Dev\AppsDeploy\<AppName>\      installer binaries (.exe/.msi/.msix),
+                                                       one subfolder per app that needs one
+                                                       -- e.g. ...\AppsDeploy\WindowsApp\,
+                                                       ...\AppsDeploy\ConnectWiseAgent\
+    Apps installed purely via winget (no repo-hosted installer) don't need
+    one of these subfolders -- winget handles its own download/cache.
+
+    Idempotency is handled inside each app's own install script (same as the
+    Automate versions) -- this menu just decides what to run, not whether it's
+    safe to run again.
+
+.PARAMETER LogPath
+    Where to write the run log. Defaults under ProgramData so it's readable
+    without a user profile loaded, consistent with the other rww-installers scripts.
+
+.NOTES
+    This is a MENU/DISPATCHER, not an installer. Exit codes reflect the run
+    as a whole:
+        0 = every selected app succeeded (or was already installed)
+        1 = one or more selected apps failed
+        3 = not running elevated
+        6 = user quit without installing anything
+        7 = aborted -- at least one selected app needed \\svazdfs001\systems$
+            access and all 3 credential attempts failed or were cancelled
+
+    Requires launching with -STA (Windows Forms needs a single-threaded
+    apartment) -- both Apps-Deploy-Menu.bat and Apps-Deploy-Menu-Blank.bat
+    already pass this.
+
+    The progress window has no visible titlebar close/min/max buttons
+    (ControlBox is off; "Close" is its own button, disabled until installs
+    finish), but Alt+F4 IS enabled -- technicians can force-close a
+    stuck/hung run. Doing so orphans the background runspace mid-install;
+    the cleanup code after ShowDialog() stops it, but whatever installer
+    process it was running (msiexec, winget, setup.exe, etc.) may be left
+    running or in a partial state on the machine. There's no graceful
+    "cancel and roll back" -- Alt+F4 is an emergency escape hatch, not a
+    clean cancel.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$LogPath = "$env:ProgramData\Dev\AppsDeploy\Logs\Apps-Deploy-Menu.log",
+
+    # When set, every app starts unchecked regardless of DefaultOn, instead
+    # of the normal fresh-deployment defaults. Used by the "blank" .bat
+    # variant for going back onto already-deployed machines to install just
+    # a couple of specific apps (e.g. Claude, which is per-user and often
+    # gets requested one machine at a time).
+    [switch]$StartBlank,
+
+    # For local testing before anything is pushed to the repo. When set,
+    # AppsDeployScripts\*.ps1 are run directly from disk (relative to this
+    # script's own folder) instead of being downloaded from GitHub. Used by
+    # Apps-Deploy-Menu-Test.bat -- the real .bat launchers never pass this.
+    [switch]$Local
+)
+
+$script:LocalRoot = $PSScriptRoot
+
+$ErrorActionPreference = 'Stop'
+
+$RepoOwner = 'randysworldwide'
+$RepoName  = 'rww-installers'
+$Branch    = 'main'
+$StagingDir = "$env:ProgramData\Dev\AppsDeploy"
+
+# ---------------------------------------------------------------------------
+# Logging for the handful of top-level messages that happen outside the
+# progress GUI (elevation failure, user-quit paths). Once installs start,
+# all logging happens inside the background runspace instead -- see
+# Show-ProgressGui's worker script.
+# ---------------------------------------------------------------------------
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    [Console]::WriteLine($line)
+    try {
+        $dir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        Add-Content -Path $LogPath -Value $line
+    } catch {
+        # Logging failures shouldn't kill the run
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+function Test-IsElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or $identity.IsSystem
+}
+
+if (-not (Test-IsElevated)) {
+    Write-Log "Not running elevated. Re-run as administrator." 'ERROR'
+    exit 3
+}
+
+# Minimize (not hide) the console window now that we're handing off to the
+# GUI, so it doesn't sit visible behind the selection/progress windows for
+# the whole run. Minimized rather than hidden on purpose: if something goes
+# wrong before a GUI ever appears, the window is still reachable from the
+# taskbar instead of vanishing outright. Failure here is purely cosmetic and
+# never blocks the rest of the script.
+try {
+    Add-Type -Name Win32Window -Namespace RWW -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+'@
+    $consolePtr = [RWW.Win32Window]::GetConsoleWindow()
+    if ($consolePtr -ne [IntPtr]::Zero) {
+        [RWW.Win32Window]::ShowWindow($consolePtr, 6) | Out-Null   # 6 = SW_MINIMIZE
+    }
+} catch {
+    # Cosmetic only -- never fail the run over this
+}
+
+# ---------------------------------------------------------------------------
+# App manifest
+# ---------------------------------------------------------------------------
+# Status:
+#   Ready       -> Install scriptblock below actually works today
+#   NeedsStaging-> script exists in repo but assumes Automate-staged files
+#                  next to it (e.g. an MSI), not a standalone GitHub pull yet
+#   Placeholder -> no install script in the repo yet
+#
+# Note (optional): shown in the GUI tooltip on hover, for anything with a
+# real-world caveat worth a tech knowing about before they pick it.
+#
+# InstallRepoPath is plain string data (not a scriptblock) on purpose --
+# it gets handed across a runspace boundary to the background install
+# worker in Show-ProgressGui, and only plain data (not scriptblocks, which
+# carry a binding back to whatever runspace created them) crosses that
+# boundary reliably. The worker's own copy of Invoke-RemoteInstallScript
+# is what actually resolves and runs each app's script.
+#
+# The order of entries below matters within a category: apps run in this
+# order when multiple are selected, so a dependency (e.g. .NET 8 Desktop
+# Runtime, needed by Dell Command | Update) should be listed before
+# anything that needs it.
+#
+# DefaultOn reflects the checkbox state when the menu first draws.
+$script:AppManifest = @(
+    # --- Initial Setup ---
+    @{ Name = 'Join Domain (rpsinc.ringpinion.com)'; Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DomainJoinInst.ps1'
+       Note = "Prompts for its OWN AD credentials, separate from the file-share prompt -- domain-join rights aren't the same as share-read rights. No auto-restart; a manual restart is needed afterward for it to fully take effect." }
+    @{ Name = 'ConnectWise Agent';              Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CWAgentInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Pulls from the private network share, not GitHub -- won't work on a machine with no network access yet." }
+    @{ Name = 'Windows App (RDP)';               Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinAppInst.ps1' }
+    @{ Name = 'ZAC Softphone';                   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ZACInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Pulls its MSI from the private share, not GitHub. Uses the .msi, not the .exe also on the share." }
+    @{ Name = 'Microsoft Visual Studio Code';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VSCodeInst.ps1' }
+    @{ Name = 'Windows Terminal';                 Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinTerminalInst.ps1' }
+    @{ Name = 'Cisco Secure Client';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CiscoSecureClientInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Runs a pre-built installer bundle from the private share -- handles the VPN profile and retries internally." }
+    @{ Name = 'Microsoft .NET Desktop Runtime 8';   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DotNet8Inst.ps1'
+       Note = "A dependency for other apps (e.g. Dell Command Update) -- installs first on purpose." }
+    @{ Name = 'Dell Command | Update';           Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DCUInst.ps1'
+       Note = "Dell hardware only; harmless elsewhere. Occasional download failures are a Dell CDN issue, not this script." }
+    @{ Name = 'VLC Media Player';                Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VLCInst.ps1' }
+    @{ Name = 'SentinelOne EDR';                 Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/SentinelOneInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Pulls its MSI and site token from the private share. The token is a secret and is never logged." }
+
+    # --- Conditional ---
+    @{ Name = 'Office O365';                     Category = 'Conditional';   DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OfficeO365Inst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Uses ODT with the x64 config. Can take 10-20+ minutes. Mutually exclusive with Office Suite 2021." }
+    @{ Name = 'Office Suite 2021';                Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/Office2021Inst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Uses ODT with the 2021 volume-license config. Can take 10-20+ minutes. Mutually exclusive with Office O365." }
+    @{ Name = 'Adobe Acrobat Pro';                Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroProInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Stages the full install folder, not just the MSI. Mutually exclusive with Acrobat Reader -- they can't coexist." }
+    @{ Name = 'Adobe Acrobat Reader';             Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroRdrInst.ps1'
+       Note = "Free Reader only. Mutually exclusive with Acrobat Pro -- they can't coexist on the same machine." }
+
+    # --- Optional ---
+    @{ Name = 'Google Chrome';                    Category = 'Optional';      DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GChromeInst.ps1' }
+    @{ Name = 'Microsoft Outlook Classic';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OutlookClassicInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Silent by design, but unverified -- has a timeout safety net just in case." }
+    @{ Name = 'Logi Options+';                    Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/LogiOptInst.ps1'
+       Note = "Doesn't force machine-wide install (known issue with that combo). May occasionally fail from an upstream hash mismatch." }
+    @{ Name = '7-Zip';                            Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/7ZipInst.ps1' }
+    @{ Name = 'Claude';                           Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ClaudeInst.ps1'
+       Note = "Installs per-user, not machine-wide -- run as the actual end user, not a technician's own account." }
+    @{ Name = 'Project Professional 2021';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ProjectPro2021Inst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Standalone install via ODT. Compatible alongside Office O365 or Office 2021, no conflict." }
+    @{ Name = 'Visio LTSC Professional 2021';     Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VisioPro2021Inst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Standalone install via ODT. Compatible alongside Office O365 or Office 2021, no conflict." }
+
+    # --- IT ---
+    @{ Name = 'Microsoft Visual C++ Redistributables'; Category = 'IT';       DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VCRedistInst.ps1'
+       Note = "Installs both x64 and x86, since some apps expect x86 even on 64-bit Windows." }
+    @{ Name = 'Java';                             Category = 'IT';            DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/JavaInst.ps1'
+       Note = "Installs Eclipse Temurin (OpenJDK), not Oracle's JDK -- avoids Oracle's licensing requirements." }
+    @{ Name = 'Git';                              Category = 'IT';            DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GitInst.ps1' }
+    @{ Name = 'GitHub CLI';                       Category = 'IT';            DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GHCliInst.ps1' }
+    @{ Name = 'Node.js';                          Category = 'IT';            DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/NodeJSInst.ps1'
+       Note = "Installs the LTS line, not the latest -- safer default for business machines." }
+    @{ Name = 'MXAdmin';                          Category = 'IT';            DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MXAdminInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Silent switch is an unverified guess. Has a 10-minute timeout in case it's wrong." }
+
+    # --- Finishing Touches ---
+    # CRITICAL: Reboot Computer must stay the LAST entry in this entire
+    # array (not just last in this category) -- see RebootInst.ps1's own
+    # header for why. Apps-Deploy-Menu.ps1 builds its selection list by
+    # walking this array in order, so as long as Reboot stays last here,
+    # it's guaranteed to run last whenever it's checked.
+    @{ Name = 'Mute Volume';                      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MuteInst.ps1'
+       Note = "Sets mute (doesn't toggle it). Least-verified script in this project -- uses hand-written COM interop with no way to compile-test it outside a real Windows box." }
+    @{ Name = 'Set Brightness to 50%';            Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/BrightnessInst.ps1'
+       Note = "Only works on laptop-integrated panels; most external desktop monitors don't support this and it will just skip harmlessly." }
+    @{ Name = 'Power Settings (Plugged In)';      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerPluggedInInst.ps1'
+       Note = "Screen off after 20 min, sleep after 60 min, while plugged in -- prevents the machine dimming/sleeping mid-deployment." }
+    @{ Name = 'Power Settings (On Battery)';      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerOnBatteryInst.ps1'
+       Note = "Screen off after 10 min, sleep after 20 min, while on battery. Harmless (and irrelevant) on a desktop with no battery." }
+    @{ Name = 'Reboot Computer';                  Category = 'Finishing Touches'; DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/RebootInst.ps1'
+       Note = "Defaults OFF on purpose -- a reboot is consequential enough that it shouldn't happen without a deliberate click. Restarts ~20 seconds after this run finishes, giving time for the summary to render." }
+)
+
+$script:CategoryOrder = @('Initial Setup', 'Conditional', 'Optional', 'IT', 'Finishing Touches')
+
+# ---------------------------------------------------------------------------
+# GUI stage 1: selection screen
+# ---------------------------------------------------------------------------
+function Show-SelectionGui {
+    param([bool]$StartBlank)
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = if ($StartBlank) { 'rww-installers - Deployment Menu (blank mode)' } else { 'rww-installers - Deployment Menu' }
+    $form.Size = New-Object System.Drawing.Size(540, 660)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+
+    # Force this window to the foreground on first appearance -- by default
+    # a window created by a background/elevated process (like this one,
+    # launched via the .bat's UAC relaunch) doesn't automatically win
+    # Windows' foreground-focus rules and can open behind whatever was
+    # already active. Briefly going TopMost grabs focus; releasing it right
+    # after means the window behaves normally afterward instead of staying
+    # pinned above everything else for the rest of the run.
+    $form.TopMost = $true
+    $form.Add_Shown({
+        $form.Activate()
+        $form.TopMost = $false
+    })
+
+    $tooltip = New-Object System.Windows.Forms.ToolTip
+    $tooltip.AutoPopDelay = 20000
+    $tooltip.InitialDelay = 300
+    $tooltip.ReshowDelay = 100
+    $tooltip.ShowAlways = $true
+
+    if ($StartBlank) {
+        $banner = New-Object System.Windows.Forms.Label
+        $banner.Text = 'Blank mode -- nothing pre-selected'
+        $banner.ForeColor = [System.Drawing.Color]::DimGray
+        $banner.Location = New-Object System.Drawing.Point(15, 8)
+        $banner.AutoSize = $true
+        $form.Controls.Add($banner)
+        $scrollTop = 30
+    } else {
+        $scrollTop = 8
+    }
+
+    $scrollPanel = New-Object System.Windows.Forms.Panel
+    $scrollPanel.AutoScroll = $true
+    $scrollPanel.Location = New-Object System.Drawing.Point(10, $scrollTop)
+    $scrollPanel.Size = New-Object System.Drawing.Size(505, 555)
+    $scrollPanel.BorderStyle = 'FixedSingle'
+    $form.Controls.Add($scrollPanel)
+
+    $checkboxByApp = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+    $y = 8
+
+    foreach ($cat in $script:CategoryOrder) {
+        $items = @($script:AppManifest | Where-Object { $_.Category -eq $cat })
+        if ($items.Count -eq 0) { continue }
+
+        $groupBox = New-Object System.Windows.Forms.GroupBox
+        $groupBox.Text = $cat
+        $groupBox.Location = New-Object System.Drawing.Point(8, $y)
+        $groupBox.Size = New-Object System.Drawing.Size(465, (24 + 24 * $items.Count))
+        $scrollPanel.Controls.Add($groupBox)
+
+        $innerY = 20
+        foreach ($app in $items) {
+            $cb = New-Object System.Windows.Forms.CheckBox
+            $cb.Text = $app.Name
+            $cb.Location = New-Object System.Drawing.Point(12, $innerY)
+            $cb.Size = New-Object System.Drawing.Size(435, 20)
+            $cb.Tag = $app
+
+            $isReady = ($app.Status -eq 'Ready')
+            $cb.Checked = $isReady -and (-not $StartBlank) -and [bool]$app.DefaultOn
+
+            if (-not $isReady) {
+                $cb.ForeColor = [System.Drawing.Color]::Gray
+                # Enabled stays $true on purpose -- a disabled control suppresses
+                # WM_MOUSEMOVE, which would silently kill the tooltip too. Instead
+                # we let it be clicked, then immediately snap it back off.
+                $cb.Add_CheckedChanged({
+                    if ($this.Checked) { $this.Checked = $false }
+                })
+            }
+
+            $noteParts = @()
+            switch ($app.Status) {
+                'Placeholder'  { $noteParts += 'No install script exists for this yet -- selecting it does nothing.' }
+                'NeedsStaging' { $noteParts += 'Has a script, but it is not wired up for standalone use yet -- selecting it does nothing.' }
+            }
+            if ($app.Note) { $noteParts += $app.Note }
+            if ($noteParts.Count -gt 0) {
+                $tooltip.SetToolTip($cb, ($noteParts -join "`r`n`r`n"))
+            }
+
+            $groupBox.Controls.Add($cb)
+            $checkboxByApp[$app] = $cb
+            $innerY += 24
+        }
+        $y += $groupBox.Height + 10
+    }
+
+    $scrollPanel.AutoScrollMinSize = New-Object System.Drawing.Size(0, $y)
+
+    # Some app pairs can't coexist on a machine (running both installs
+    # together is either unsupported or actively conflicts) -- checking one
+    # immediately unchecks AND disables the other, so it can't be clicked
+    # at all while the first stays selected.
+    #
+    # Implementation note: $partnerOf is declared here, in Show-SelectionGui's
+    # own function scope, which stays on the call stack for the whole
+    # $form.ShowDialog() message pump below -- the same reasoning that
+    # already makes Show-ProgressGui's Timer.Add_Tick handler able to read
+    # $logQueue/$state safely. The event handlers below use $this (the
+    # sender checkbox, the same idiom already used for the disabled-checkbox
+    # handler above) to look up the partner rather than trying to capture a
+    # specific checkbox variable from inside a helper function that would
+    # have already returned by the time the event actually fires.
+    $partnerOf = New-Object 'System.Collections.Generic.Dictionary[object,object]'
+
+    function Register-MutuallyExclusivePair {
+        param(
+            [Parameter(Mandatory)][string]$NameA,
+            [Parameter(Mandatory)][string]$NameB
+        )
+        $appA = $script:AppManifest | Where-Object { $_.Name -eq $NameA } | Select-Object -First 1
+        $appB = $script:AppManifest | Where-Object { $_.Name -eq $NameB } | Select-Object -First 1
+        if (-not ($appA -and $appB -and $checkboxByApp.ContainsKey($appA) -and $checkboxByApp.ContainsKey($appB))) {
+            return
+        }
+        $partnerOf[$checkboxByApp[$appA]] = $checkboxByApp[$appB]
+        $partnerOf[$checkboxByApp[$appB]] = $checkboxByApp[$appA]
+    }
+
+    # Office O365 vs Office Suite 2021 -- running both installs together
+    # isn't a supported Office configuration.
+    Register-MutuallyExclusivePair -NameA 'Office O365' -NameB 'Office Suite 2021'
+
+    # Adobe Acrobat Reader vs Adobe Acrobat Pro -- modern, 64-bit-unified
+    # builds of these can't coexist on the same machine at all; installing
+    # one replaces the other.
+    Register-MutuallyExclusivePair -NameA 'Adobe Acrobat Reader' -NameB 'Adobe Acrobat Pro'
+
+    foreach ($cb in $partnerOf.Keys) {
+        $cb.Add_CheckedChanged({
+            $partner = $partnerOf[$this]
+            if ($this.Checked) {
+                $partner.Checked = $false
+                $partner.Enabled = $false
+            } else {
+                $partner.Enabled = $true
+            }
+        })
+    }
+
+    # The initial Checked state above was set directly on each checkbox
+    # BEFORE these handlers existed, so it never triggered the disable
+    # logic -- without this pass, a Default ON app (e.g. Office O365)
+    # shows checked at load with its partner still clickable, only
+    # actually disabling it after the first real click. Sync once here so
+    # the initial render already matches what the handler would produce.
+    foreach ($cb in $partnerOf.Keys) {
+        if ($cb.Checked) {
+            $partnerOf[$cb].Enabled = $false
+        }
+    }
+
+    $btnRun = New-Object System.Windows.Forms.Button
+    $btnRun.Text = 'Install Selected'
+    $btnRun.Location = New-Object System.Drawing.Point(300, ($scrollTop + 565))
+    $btnRun.Size = New-Object System.Drawing.Size(210, 34)
+    $btnRun.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Controls.Add($btnRun)
+
+    $btnQuit = New-Object System.Windows.Forms.Button
+    $btnQuit.Text = 'Quit'
+    $btnQuit.Location = New-Object System.Drawing.Point(15, ($scrollTop + 565))
+    $btnQuit.Size = New-Object System.Drawing.Size(110, 34)
+    $btnQuit.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($btnQuit)
+
+    $form.AcceptButton = $btnRun
+    $form.CancelButton = $btnQuit
+    $form.ClientSize = New-Object System.Drawing.Size(535, ($scrollTop + 615))
+
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+
+    $selected = @()
+    # Walk $script:AppManifest -- NOT $checkboxByApp.Keys -- to build the
+    # selection. .NET Dictionaries don't guarantee enumeration order
+    # matches insertion order (it usually happens to in practice, but
+    # that's an implementation detail, not a contract). That was a
+    # low-stakes gap before (it only affected soft ordering, like .NET 8
+    # installing before Dell Command Update), but it stops being
+    # low-stakes once the manifest includes things like domain join and
+    # a reboot -- a reboot firing mid-queue instead of at the end because
+    # of an unguaranteed enumeration order would be a real problem, not
+    # just a cosmetic one. $script:AppManifest is a plain array, so its
+    # order is guaranteed and matches exactly what's documented in the
+    # manifest comments below.
+    foreach ($app in $script:AppManifest) {
+        if ($checkboxByApp.ContainsKey($app) -and $checkboxByApp[$app].Checked) {
+            $selected += $app
+        }
+    }
+    return $selected
+}
+
+# ---------------------------------------------------------------------------
+# GUI stage 2: progress screen. Runs the actual installs on a background
+# runspace so the window stays responsive, and polls a thread-safe queue to
+# stream each script's log lines into the textbox live.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Some apps' install scripts pull their installer files from
+# \\svazdfs001\systems$ (or its \\10.1.0.5 IP fallback) -- a domain file
+# share. If this menu is run under a LOCAL account rather than a domain
+# account (e.g. a local Administrator account, as happened during testing),
+# Windows has no cached credential for that share and every one of those
+# installs fails with a "could not reach" error, even though the files are
+# genuinely there.
+#
+# This prompts for AD credentials once, up front, but ONLY if at least one
+# of the SELECTED apps actually needs the share (checked via each app's
+# NeedsShareCredentials manifest flag) -- apps that don't touch the share
+# never trigger this prompt. It then establishes an authenticated SMB
+# session via `net use` before any installs run.
+#
+# That session is cached at the Windows logon-session level, not per
+# process, so it's automatically available to the background install
+# runspace too (same process, same access token) without needing to pass
+# credentials into each individual app script -- none of the 9 app scripts
+# that use the share needed any changes for this to work.
+# ---------------------------------------------------------------------------
+# Returns $true if share access was established (or wasn't needed at all),
+# $false if none of the selected apps need it -- wait, that's also $true.
+# Returns $false ONLY when at least one selected app needs the share and
+# every credential attempt failed -- the caller treats that as fatal and
+# aborts the whole run rather than proceeding into installs that are
+# guaranteed to fail.
+function Request-ShareAccessIfNeeded {
+    param([Parameter(Mandatory)][array]$SelectedApps)
+
+    $needsShare = @($SelectedApps | Where-Object { $_.NeedsShareCredentials })
+    if ($needsShare.Count -eq 0) {
+        return $true
+    }
+
+    $appNames = ($needsShare | ForEach-Object { $_.Name }) -join ', '
+    Write-Log "The following selected apps need access to \\svazdfs001\systems`$: $appNames"
+
+    $sharePaths  = @('\\svazdfs001\systems$', '\\10.1.0.5\systems$')
+    $maxAttempts = 3
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $cred = Get-Credential -UserName 'RPSINC\' -Message "Enter AD credentials (e.g. DOMAIN\username) with access to \\svazdfs001\systems$ -- needed for: $appNames"
+        if (-not $cred) {
+            Write-Log "Credential prompt was cancelled (attempt $attempt/$maxAttempts)." 'WARN'
+            continue
+        }
+
+        $anySucceeded = $false
+        foreach ($path in $sharePaths) {
+            try {
+                # Drop any existing session to this target first -- Windows
+                # won't let you reconnect with different credentials to a
+                # UNC target it's already connected to, which matters on a
+                # retry after a mistyped password.
+                Start-Process -FilePath 'net.exe' -ArgumentList @('use', $path, '/delete', '/y') `
+                    -Wait -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
+
+                $netUseArgs = @('use', $path, "/user:$($cred.UserName)", $cred.GetNetworkCredential().Password, '/persistent:no')
+                $proc = Start-Process -FilePath 'net.exe' -ArgumentList $netUseArgs -Wait -PassThru -NoNewWindow
+                if ($proc.ExitCode -eq 0) {
+                    Write-Log "Authenticated to $path successfully."
+                    $anySucceeded = $true
+                } else {
+                    Write-Log "Could not authenticate to $path (net use exit $($proc.ExitCode))." 'WARN'
+                }
+            } catch {
+                Write-Log "Error attempting to authenticate to $path : $($_.Exception.Message)" 'WARN'
+            }
+        }
+
+        if ($anySucceeded) {
+            return $true
+        }
+
+        Write-Log "Credential attempt $attempt/$maxAttempts failed for both share paths." 'WARN'
+    }
+
+    $failMessage = "Could not establish access to \\svazdfs001\systems$ after $maxAttempts attempts (wrong credentials, cancelled, or the share is genuinely unreachable). Aborting -- selected apps needing the share ($appNames) would only fail anyway."
+    Write-Log $failMessage 'ERROR'
+
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show(
+        $failMessage, 'rww-installers - Share access failed',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+
+    return $false
+}
+
+function Show-ProgressGui {
+    param(
+        [Parameter(Mandatory)][array]$Apps,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$StagingDir,
+        [Parameter(Mandatory)][string]$RepoOwner,
+        [Parameter(Mandatory)][string]$RepoName,
+        [Parameter(Mandatory)][string]$Branch,
+        [bool]$UseLocal = $false,
+        [string]$LocalRoot = ''
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    # --- Thread-safe state shared between the UI thread and the worker runspace ---
+    $logQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $state = [hashtable]::Synchronized(@{
+        CurrentApp    = ''
+        Index         = 0
+        Total         = $Apps.Count
+        AppDone       = $false
+        AllDone       = $false
+        FinalExitCode = 0
+    })
+
+    # --- Background runspace that does the actual installing ---
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+
+    $workerScript = {
+        param($Apps, $LogPath, $StagingDir, $RepoOwner, $RepoName, $Branch, $QueueRef, $StateRef, $UseLocal, $LocalRoot)
+
+        # $Global:RWWQueue (not just a local variable) so that Write-Log calls
+        # inside downloaded child scripts -- which may be many function-call
+        # levels deep in a totally different script file -- can still find it.
+        # PowerShell scriptblocks resolve variables dynamically from the
+        # CALLER's scope chain when invoked with &, not from where they were
+        # originally defined, so anything short of Global scope would silently
+        # fail to resolve from inside those child scripts.
+        $Global:RWWQueue = $QueueRef
+        $Global:RWWLogSink = { param($line) $Global:RWWQueue.Enqueue($line) }
+
+        function Write-WorkerLog {
+            param([string]$Message, [string]$Level = 'INFO')
+            $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+            $Global:RWWQueue.Enqueue($line)
+            try {
+                $dir = Split-Path -Path $LogPath -Parent
+                if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                Add-Content -Path $LogPath -Value $line
+            } catch {}
+        }
+
+        function Invoke-RemoteInstallScript {
+            param(
+                [Parameter(Mandatory)][string]$RepoPath,
+                [string[]]$ScriptArgs = @()
+            )
+
+            if ($UseLocal) {
+                # Local test mode: run straight from disk, relative to this
+                # menu script's own folder -- e.g. RepoPath
+                # 'Scripts/WorkstationDeployment/AppsDeployScripts/CWAgentInst.ps1'
+                # becomes '<LocalRoot>\AppsDeployScripts\CWAgentInst.ps1'.
+                # No GitHub involved at all.
+                $relative = $RepoPath -replace '^Scripts/WorkstationDeployment/', ''
+                $localScriptPath = Join-Path $LocalRoot ($relative -replace '/', '\')
+                if (-not (Test-Path $localScriptPath)) {
+                    Write-WorkerLog "[LOCAL TEST] Script not found: $localScriptPath" 'ERROR'
+                    return 2
+                }
+                Write-WorkerLog "[LOCAL TEST] Running $localScriptPath (no download, no GitHub)"
+                try {
+                    & $localScriptPath @ScriptArgs
+                    return $LASTEXITCODE
+                } catch {
+                    Write-WorkerLog "$localScriptPath threw an unhandled error: $($_.Exception.Message)" 'ERROR'
+                    return 1
+                }
+            }
+
+            $fileName  = Split-Path -Path $RepoPath -Leaf
+            $localPath = Join-Path $StagingDir $fileName
+            $url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$RepoPath"
+            try {
+                if (-not (Test-Path $StagingDir)) { New-Item -Path $StagingDir -ItemType Directory -Force | Out-Null }
+                Write-WorkerLog "Fetching $url"
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -Uri $url -OutFile $localPath -UseBasicParsing
+            } catch {
+                Write-WorkerLog "Failed to download $fileName from GitHub: $($_.Exception.Message)" 'ERROR'
+                Write-WorkerLog "If this is a fresh/pre-domain machine, check that the TLS inspection proxy's root cert is trusted, and that raw.githubusercontent.com is reachable." 'ERROR'
+                return 2
+            }
+            try {
+                & $localPath @ScriptArgs
+                return $LASTEXITCODE
+            } catch {
+                Write-WorkerLog "$fileName threw an unhandled error: $($_.Exception.Message)" 'ERROR'
+                return 1
+            }
+        }
+
+        try {
+            Write-WorkerLog "=== Apps-Deploy-Menu install run starting ==="
+            Write-WorkerLog ("Selected: " + (($Apps | ForEach-Object { $_.Name }) -join ', '))
+
+            $results = @()
+            $i = 0
+            foreach ($app in $Apps) {
+                $i++
+                $StateRef.Index = $i
+                $StateRef.CurrentApp = $app.Name
+                $StateRef.AppDone = $false
+
+                Write-WorkerLog ""
+                Write-WorkerLog "--- $($app.Name) ($i of $($Apps.Count)) ---"
+
+                $code = Invoke-RemoteInstallScript -RepoPath $app.InstallRepoPath
+                $ok = ($code -eq 0 -or $code -eq 4)   # 4 = "already installed", per existing scripts' convention
+                if ($ok) {
+                    Write-WorkerLog "$($app.Name) finished (exit $code)."
+                } else {
+                    Write-WorkerLog "$($app.Name) FAILED (exit $code). Check its own log under $StagingDir\Logs." 'ERROR'
+                }
+                $results += [pscustomobject]@{ Name = $app.Name; Result = if ($ok) { 'OK' } else { 'FAILED' }; Code = $code }
+
+                $StateRef.AppDone = $true
+                Start-Sleep -Milliseconds 500   # let the UI actually show the "filled" state before resetting
+            }
+
+            Write-WorkerLog ""
+            Write-WorkerLog "=== Summary ==="
+            foreach ($r in $results) {
+                Write-WorkerLog ("{0,-35} {1}" -f $r.Name, $r.Result)
+            }
+
+            $anyFailed = $results | Where-Object { $_.Result -eq 'FAILED' }
+            if ($anyFailed) {
+                Write-WorkerLog "One or more apps failed. See log at $LogPath" 'ERROR'
+                $StateRef.FinalExitCode = 1
+            } else {
+                Write-WorkerLog "Run complete."
+                $StateRef.FinalExitCode = 0
+            }
+        } catch {
+            Write-WorkerLog "Unhandled error in install run: $($_.Exception.Message)" 'ERROR'
+            $StateRef.FinalExitCode = 1
+        } finally {
+            $StateRef.AllDone = $true
+        }
+    }
+
+    [void]$ps.AddScript($workerScript)
+    [void]$ps.AddArgument($Apps)
+    [void]$ps.AddArgument($LogPath)
+    [void]$ps.AddArgument($StagingDir)
+    [void]$ps.AddArgument($RepoOwner)
+    [void]$ps.AddArgument($RepoName)
+    [void]$ps.AddArgument($Branch)
+    [void]$ps.AddArgument($logQueue)
+    [void]$ps.AddArgument($state)
+    [void]$ps.AddArgument($UseLocal)
+    [void]$ps.AddArgument($LocalRoot)
+
+    $asyncResult = $ps.BeginInvoke()
+
+    # --- Progress form ---
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = if ($UseLocal) { 'rww-installers - Installing (LOCAL TEST MODE)' } else { 'rww-installers - Installing' }
+    $form.Size = New-Object System.Drawing.Size(1280, 680)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'Sizable'
+    $form.MaximizeBox = $true
+    $form.MinimizeBox = $true
+    $form.MinimumSize = New-Object System.Drawing.Size(760, 420)
+    $form.ControlBox = $false
+
+    # Same foreground-focus fix as the selection window -- see its comment
+    # for why this is needed.
+    $form.TopMost = $true
+    $form.Add_Shown({
+        $form.Activate()
+        $form.TopMost = $false
+    })
+
+    # Alt+F4 is intentionally left enabled (no FormClosing cancellation) --
+    # technicians running this need a way to force-kill a stuck/hung run.
+    # ControlBox stays $false (no visible titlebar close/min/max buttons,
+    # "Close" is its own button below, disabled until installs finish) but
+    # Alt+F4 still works as a normal OS-level accelerator regardless of
+    # ControlBox. Closing mid-install orphans the background runspace, but
+    # the cleanup code after ShowDialog() below already handles that --
+    # $ps.Stop() runs if the runspace hasn't finished when the form closes
+    # for any reason, Alt+F4 included.
+
+    $lblCurrent = New-Object System.Windows.Forms.Label
+    $lblCurrent.Location = New-Object System.Drawing.Point(15, 15)
+    $lblCurrent.Size = New-Object System.Drawing.Size(1240, 20)
+    $lblCurrent.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $lblCurrent.Font = New-Object System.Drawing.Font($lblCurrent.Font, [System.Drawing.FontStyle]::Bold)
+    $lblCurrent.Text = 'Starting...'
+    $form.Controls.Add($lblCurrent)
+
+    $barCurrent = New-Object System.Windows.Forms.ProgressBar
+    $barCurrent.Location = New-Object System.Drawing.Point(15, 40)
+    $barCurrent.Size = New-Object System.Drawing.Size(1240, 24)
+    $barCurrent.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $barCurrent.Style = 'Marquee'
+    $barCurrent.MarqueeAnimationSpeed = 30
+    $form.Controls.Add($barCurrent)
+
+    $lblOverall = New-Object System.Windows.Forms.Label
+    $lblOverall.Location = New-Object System.Drawing.Point(15, 72)
+    $lblOverall.Size = New-Object System.Drawing.Size(1240, 18)
+    $lblOverall.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $lblOverall.Text = "App 0 of $($Apps.Count)"
+    $form.Controls.Add($lblOverall)
+
+    $barOverall = New-Object System.Windows.Forms.ProgressBar
+    $barOverall.Location = New-Object System.Drawing.Point(15, 92)
+    $barOverall.Size = New-Object System.Drawing.Size(1240, 18)
+    $barOverall.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $barOverall.Minimum = 0
+    $barOverall.Maximum = [Math]::Max($Apps.Count, 1)
+    $barOverall.Value = 0
+    $form.Controls.Add($barOverall)
+
+    $txtLog = New-Object System.Windows.Forms.TextBox
+    $txtLog.Location = New-Object System.Drawing.Point(15, 120)
+    $txtLog.Size = New-Object System.Drawing.Size(1240, 460)
+    $txtLog.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $txtLog.Multiline = $true
+    $txtLog.ReadOnly = $true
+    $txtLog.ScrollBars = 'Both'
+    $txtLog.WordWrap = $false
+    $txtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $txtLog.BackColor = [System.Drawing.Color]::Black
+    $txtLog.ForeColor = [System.Drawing.Color]::LightGray
+    $form.Controls.Add($txtLog)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = 'Close'
+    $btnClose.Location = New-Object System.Drawing.Point(1165, 590)
+    $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $btnClose.Enabled = $false
+    $form.Controls.Add($btnClose)
+    $btnClose.Add_Click({ $form.Close() })
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 150
+    $timer.Add_Tick({
+        $line = $null
+        $appended = $false
+        while ($logQueue.TryDequeue([ref]$line)) {
+            $txtLog.AppendText($line + "`r`n")
+            $appended = $true
+        }
+        if ($appended) {
+            $txtLog.SelectionStart = $txtLog.Text.Length
+            $txtLog.ScrollToCaret()
+        }
+
+        if ($state.Index -gt 0) {
+            $lblCurrent.Text = "Installing: $($state.CurrentApp)"
+            $lblOverall.Text = "App $($state.Index) of $($state.Total)"
+        }
+
+        if ($state.AppDone) {
+            $barCurrent.Style = 'Continuous'
+            $barCurrent.Maximum = 100
+            $barCurrent.Value = 100
+            $barOverall.Value = [Math]::Min($state.Index, $barOverall.Maximum)
+        } elseif ($barCurrent.Style -ne 'Marquee') {
+            $barCurrent.Style = 'Marquee'
+        }
+
+        if ($state.AllDone) {
+            $timer.Stop()
+            if ($state.FinalExitCode -eq 0) {
+                $lblCurrent.Text = 'All selected apps finished successfully.'
+            } else {
+                $lblCurrent.Text = 'Finished with one or more failures -- see log above.'
+                $lblCurrent.ForeColor = [System.Drawing.Color]::Firebrick
+            }
+            $barCurrent.Style = 'Continuous'
+            $barCurrent.Value = 100
+            $barOverall.Value = $barOverall.Maximum
+            $btnClose.Enabled = $true
+        }
+    })
+    $timer.Start()
+
+    [void]$form.ShowDialog()
+    $timer.Stop()
+    $form.Dispose()
+
+    # --- Clean up the background runspace ---
+    try {
+        if (-not $asyncResult.IsCompleted) { $ps.Stop() }
+        $ps.EndInvoke($asyncResult) | Out-Null
+    } catch {}
+    $ps.Dispose()
+    $runspace.Close()
+    $runspace.Dispose()
+
+    return $state.FinalExitCode
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+Write-Log "=== Apps-Deploy-Menu starting on $env:COMPUTERNAME ==="
+
+$selected = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
+
+if ($null -eq $selected) {
+    Write-Log "User quit without installing anything."
+    exit 6
+}
+if ($selected.Count -eq 0) {
+    Write-Log "Nothing was selected. Exiting."
+    exit 6
+}
+
+$shareAccessOk = Request-ShareAccessIfNeeded -SelectedApps $selected
+if (-not $shareAccessOk) {
+    Write-Log "Aborting run -- share credentials could not be established. See error above."
+    exit 7
+}
+
+$exitCode = Show-ProgressGui -Apps $selected -LogPath $LogPath -StagingDir $StagingDir `
+    -RepoOwner $RepoOwner -RepoName $RepoName -Branch $Branch -UseLocal:$Local.IsPresent -LocalRoot $script:LocalRoot
+
+exit $exitCode
