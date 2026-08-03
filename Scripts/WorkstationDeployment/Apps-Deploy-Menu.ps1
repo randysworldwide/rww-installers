@@ -208,6 +208,9 @@ public static extern IntPtr GetConsoleWindow();
 # DefaultOn reflects the checkbox state when the menu first draws.
 $script:AppManifest = @(
     # --- Initial Setup ---
+    @{ Name = 'Change Computer Name';            Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ChangeComputerNameInst.ps1'
+       Note = "Prompts for the new name at runtime. Runs before Join Domain on purpose -- renaming while still a workgroup machine only needs local admin rights, not domain permissions." }
     @{ Name = 'Join Domain (rpsinc.ringpinion.com)'; Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DomainJoinInst.ps1'
        Note = "Prompts for its OWN AD credentials, separate from the file-share prompt -- domain-join rights aren't the same as share-read rights. No auto-restart; a manual restart is needed afterward for it to fully take effect." }
