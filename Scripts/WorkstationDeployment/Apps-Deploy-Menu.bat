@@ -47,6 +47,11 @@ set "EXITCODE=%errorlevel%"
 
 echo.
 echo Deployment menu finished with exit code %EXITCODE%.
-pause
+:: Short auto-continuing pause (not a blocking "pause") -- this window
+:: was staying open indefinitely waiting for a keypress even after the
+:: main GUI's own "Close" button had already been clicked and the
+:: PowerShell process behind it had already exited. This just gives a
+:: brief moment to glimpse the exit code before closing on its own.
+timeout /t 8 /nobreak >nul
 endlocal
 exit /b %EXITCODE%
