@@ -268,15 +268,18 @@ public static extern IntPtr GetConsoleWindow();
 # DefaultOn reflects the checkbox state when the menu first draws.
 $script:AppManifest = @(
     # --- Initial Setup ---
+    @{ Name = 'Enable Administrator Account';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/EnableAdminAccountInst.ps1'
+       Note = "Prompts for a password at runtime (masked, with confirm). Defaults ON -- a known-good local admin fallback matters more once Remove Throwaway Setup Account has run." }
     @{ Name = 'Change Computer Name';            Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ChangeComputerNameInst.ps1'
        Note = "Prompts for the new name at runtime. Runs before Join Domain on purpose -- renaming while still a workgroup machine only needs local admin rights, not domain permissions." }
-    @{ Name = 'Enable Administrator Account (Safety Net)'; Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/EnableAdminAccountInst.ps1'
-       Note = "Prompts for a password at runtime (masked, with confirm). Defaults ON -- a known-good local admin fallback matters more once Remove Throwaway Setup Account has run." }
     @{ Name = 'Join Domain (rpsinc.ringpinion.com)'; Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DomainJoinInst.ps1'
        Note = "Prompts for its OWN AD credentials, separate from the file-share prompt -- domain-join rights aren't the same as share-read rights. No auto-restart; a manual restart is needed afterward for it to fully take effect." }
+    @{ Name = 'Remove OEM Bloatware';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DebloatOEMInst.ps1'
+       Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer and ALL pre-installed Office/OneNote (every language, including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
     @{ Name = 'ConnectWise Agent';              Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CWAgentInst.ps1'
        NeedsShareCredentials = $true
