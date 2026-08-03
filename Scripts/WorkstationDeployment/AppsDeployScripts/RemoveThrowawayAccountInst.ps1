@@ -46,6 +46,17 @@
          there) now correctly keeps retrying on subsequent boots instead
          of silently giving up.
 
+    ALSO FIXED: even after the throwaway account is deleted, Windows'
+    logon screen kept defaulting to (trying to show a tile for) that now-
+    deleted account, since it remembers the "last logged on user" via the
+    LogonUI registry keys independently of whether the account still
+    exists. The cleanup script now updates those keys to point at the
+    built-in Administrator account once removal succeeds, so the logon
+    screen defaults there instead of to a ghost tile. This part is based
+    on general Windows internals knowledge (the LogonUI mechanism itself),
+    not something confirmed on a real logon screen yet -- flagging that
+    honestly rather than presenting it as verified.
+
     Steps this script performs NOW (pre-reboot):
       1. Determine the target account -- defaults to whichever account is
          currently running this script ($env:USERNAME), NOT a hardcoded
@@ -207,6 +218,43 @@ try {
     $accountRemoved = $true
 } catch {
     Write-CleanupLog "Failed to remove local account: $($_.Exception.Message)" 'ERROR'
+}
+
+# BEST EFFORT, NOT VERIFIED LIVE (flagging honestly, same as anywhere else
+# in this project where that's true): even after the account is deleted,
+# Windows' logon screen still remembers it via the LogonUI registry keys
+# and keeps trying to show/pre-select a tile for it. This updates those
+# same keys to point at the built-in Administrator account instead, so
+# the logon screen defaults there rather than to a ghost tile for an
+# account that no longer exists. The SID needs to be written in its raw
+# BINARY form (not the string "S-1-5-...") to match what Windows itself
+# stores -- using .NET's own SecurityIdentifier.GetBinaryForm() for that
+# conversion rather than hand-building the bytes, which is the correct,
+# well-documented way to do it, but the overall LogonUI mechanism itself
+# is based on general Windows internals knowledge, not something this
+# project has been able to confirm on a real login screen yet.
+if ($accountRemoved) {
+    try {
+        $adminAccount = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1
+        if ($adminAccount) {
+            $logonUiKey   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI'
+            $samQualified = "$env:COMPUTERNAME\$($adminAccount.Name)"
+
+            $sid      = New-Object System.Security.Principal.SecurityIdentifier($adminAccount.SID.Value)
+            $sidBytes = New-Object byte[] ($sid.BinaryLength)
+            $sid.GetBinaryForm($sidBytes, 0)
+
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUser' -Value $samQualified -Type String -ErrorAction Stop
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnSAMUser' -Value $samQualified -Type String -ErrorAction Stop
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUserSID' -Value $sidBytes -Type Binary -ErrorAction Stop
+
+            Write-CleanupLog "Updated the logon screen's default user to '$($adminAccount.Name)' so it stops defaulting to the now-deleted $TargetAccount account."
+        } else {
+            Write-CleanupLog "Could not find the built-in Administrator account (SID -500) to point the logon screen at -- skipping this step." 'WARN'
+        }
+    } catch {
+        Write-CleanupLog "Failed to update the logon screen default user (non-fatal, doesn't affect the account/folder removal above): $($_.Exception.Message)" 'WARN'
+    }
 }
 
 # Profile removal is tracked SEPARATELY from account removal -- a machine
