@@ -98,6 +98,41 @@
     running or in a partial state on the machine. There's no graceful
     "cancel and roll back" -- Alt+F4 is an emergency escape hatch, not a
     clean cancel.
+
+    MID-RUN REBOOT AND AUTO-RESUME (Change Computer Name + Join Domain):
+    every other reboot-needing step in this project (Domain Join alone,
+    Change Computer Name alone, Reboot Computer itself) just logs a
+    "restart needed" warning and keeps the current session going --
+    nothing about the change is actually live until some LATER restart,
+    whenever that happens. The one exception is when Change Computer Name
+    and Join Domain are BOTH selected: they combine into a single
+    Add-Computer -NewName call (see DomainJoinInst.ps1), and neither the
+    new name nor the domain membership is live until an ACTUAL restart
+    happens -- continuing the same session afterward would be operating
+    on stale identity information. So specifically in that combination,
+    right after Join Domain reports success, this script:
+      1. Saves whatever apps were still left in the selected queue (by
+         name, in order) to PendingResumeApps.txt.
+      2. Registers a one-time Scheduled Task ("RWW-ResumeDeployment"),
+         triggered at the next interactive logon of the current user,
+         that re-launches this same script with -ResumeAfterReboot.
+      3. Restarts the machine (20-second delay, same reasoning as
+         RebootInst.ps1 -- lets the progress window's state render first).
+    On the next logon, the resume task runs this script again with
+    -ResumeAfterReboot: it skips the selection GUI entirely, reads back
+    the saved app list, and continues installing exactly where it left
+    off -- including re-prompting for share credentials if needed, since
+    those don't persist across a reboot.
+
+    UNTESTED, FLAGGING HONESTLY: this depends on the "at logon" Scheduled
+    Task trigger actually firing after whatever gets the machine back to
+    an interactive desktop (AutoAdminLogon if configured, or a manual
+    logon otherwise) -- similar category of assumption as
+    RemoveThrowawayAccountInst.ps1's original "at startup" trigger, which
+    turned out to race against AutoAdminLogon in real testing. This one
+    is "at logon" rather than "at startup" specifically to avoid that
+    same race (it fires as a consequence of the logon itself, not
+    competing with it), but it hasn't been exercised on a real machine yet.
 #>
 
 [CmdletBinding()]
@@ -115,7 +150,18 @@ param(
     # AppsDeployScripts\*.ps1 are run directly from disk (relative to this
     # script's own folder) instead of being downloaded from GitHub. Used by
     # Apps-Deploy-Menu-Test.bat -- the real .bat launchers never pass this.
-    [switch]$Local
+    [switch]$Local,
+
+    # When set, skips the selection GUI entirely and resumes a deployment
+    # run that was interrupted by a mid-run reboot -- specifically the
+    # Change Computer Name + Join Domain combination, which needs a real
+    # restart to actually take effect (unlike everything else in this
+    # project, which defers restart to the end). A Scheduled Task passes
+    # this automatically at the next logon; nothing about this needs to
+    # be passed manually by a technician. See the resume-handling block in
+    # Main, and the reboot-triggering block in Show-ProgressGui's worker
+    # script, for the two ends of this mechanism.
+    [switch]$ResumeAfterReboot
 )
 
 $script:LocalRoot = $PSScriptRoot
@@ -126,6 +172,20 @@ $RepoOwner = 'randysworldwide'
 $RepoName  = 'rww-installers'
 $Branch    = 'main'
 $StagingDir = "$env:ProgramData\Dev\AppsDeploy"
+
+# Shared with the reboot-and-resume mechanism in Show-ProgressGui's worker
+# script and the resume-handling block in Main below. Named apps (one per
+# line, in original selection order) that still need to run after a
+# mid-run reboot triggered by Change Computer Name + Join Domain running
+# together.
+$script:ResumeStateFile = "$env:ProgramData\Dev\AppsDeploy\PendingResumeApps.txt"
+$script:ResumeTaskName  = 'RWW-ResumeDeployment'
+# Needed so the resume scheduled task knows what to re-launch after a
+# mid-run reboot -- $PSCommandPath only resolves correctly here, in the
+# top-level script; it wouldn't resolve inside the in-memory scriptblock
+# Show-ProgressGui's worker runs via AddScript(), so it's captured once
+# here and threaded through as a parameter instead.
+$script:SelfScriptPath  = $PSCommandPath
 
 # ---------------------------------------------------------------------------
 # Logging for the handful of top-level messages that happen outside the
@@ -663,7 +723,10 @@ function Show-ProgressGui {
         [Parameter(Mandatory)][string]$RepoName,
         [Parameter(Mandatory)][string]$Branch,
         [bool]$UseLocal = $false,
-        [string]$LocalRoot = ''
+        [string]$LocalRoot = '',
+        [string]$ResumeStateFile = '',
+        [string]$ResumeTaskName = '',
+        [string]$SelfScriptPath = ''
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -688,7 +751,7 @@ function Show-ProgressGui {
     $ps.Runspace = $runspace
 
     $workerScript = {
-        param($Apps, $LogPath, $StagingDir, $RepoOwner, $RepoName, $Branch, $QueueRef, $StateRef, $UseLocal, $LocalRoot)
+        param($Apps, $LogPath, $StagingDir, $RepoOwner, $RepoName, $Branch, $QueueRef, $StateRef, $UseLocal, $LocalRoot, $ResumeStateFile, $ResumeTaskName, $SelfScriptPath)
 
         # $Global:RWWQueue (not just a local variable) so that Write-Log calls
         # inside downloaded child scripts -- which may be many function-call
@@ -809,6 +872,54 @@ function Show-ProgressGui {
 
                 $StateRef.AppDone = $true
                 Start-Sleep -Milliseconds 500   # let the UI actually show the "filled" state before resetting
+
+                # Change Computer Name + Join Domain together need a REAL
+                # reboot to actually take effect (unlike everything else in
+                # this project, which just logs a "restart needed" warning
+                # and keeps going) -- the combined Add-Computer -NewName
+                # call only stages both changes; nothing about the new name
+                # or domain membership is live until Windows restarts. So
+                # rather than continue this session pretending both are
+                # already in effect, reboot now and pick up any remaining
+                # selected apps automatically afterward via a one-time
+                # "at logon" Scheduled Task.
+                if ($app.Name -eq 'Join Domain (rpsinc.ringpinion.com)' -and $ok -and $Global:RWWCombineRenameAndJoin) {
+                    $remainingApps = @($Apps[$i..($Apps.Count - 1)])
+                    if ($remainingApps.Count -gt 0) {
+                        Write-WorkerLog ""
+                        Write-WorkerLog "Change Computer Name + Join Domain both completed -- a restart is required for the new name and domain membership to actually take effect."
+                        Write-WorkerLog ("Remaining selected app(s) will resume automatically after logging back in: " + (($remainingApps | ForEach-Object { $_.Name }) -join ', '))
+
+                        try {
+                            $remainingApps | ForEach-Object { $_.Name } | Set-Content -LiteralPath $ResumeStateFile -Encoding UTF8 -ErrorAction Stop
+
+                            $resumeAction    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                                -Argument "-NoProfile -STA -ExecutionPolicy Bypass -File `"$SelfScriptPath`" -ResumeAfterReboot"
+                            $resumeTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+                            $resumePrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+                            $resumeSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+                            Register-ScheduledTask -TaskName $ResumeTaskName -Action $resumeAction -Trigger $resumeTrigger `
+                                -Principal $resumePrincipal -Settings $resumeSettings -Force -ErrorAction Stop | Out-Null
+
+                            Write-WorkerLog "Registered resume task '$ResumeTaskName' for user '$env:USERNAME' at next logon."
+                        } catch {
+                            Write-WorkerLog "Failed to set up automatic resume: $($_.Exception.Message)" 'ERROR'
+                            Write-WorkerLog "The remaining apps listed above will need to be selected manually after restarting." 'ERROR'
+                        }
+
+                        Write-WorkerLog "Restarting in 20 seconds..." 'WARN'
+                        $StateRef.FinalExitCode = 0
+                        $StateRef.AllDone = $true
+                        Start-Sleep -Seconds 20
+                        try {
+                            Restart-Computer -Force -ErrorAction Stop
+                        } catch {
+                            Write-WorkerLog "Restart-Computer failed: $($_.Exception.Message)" 'ERROR'
+                        }
+                        break
+                    }
+                }
             }
 
             Write-WorkerLog ""
@@ -844,6 +955,9 @@ function Show-ProgressGui {
     [void]$ps.AddArgument($state)
     [void]$ps.AddArgument($UseLocal)
     [void]$ps.AddArgument($LocalRoot)
+    [void]$ps.AddArgument($ResumeStateFile)
+    [void]$ps.AddArgument($ResumeTaskName)
+    [void]$ps.AddArgument($SelfScriptPath)
 
     $asyncResult = $ps.BeginInvoke()
 
@@ -995,15 +1109,67 @@ function Show-ProgressGui {
 # ---------------------------------------------------------------------------
 Write-Log "=== Apps-Deploy-Menu starting on $env:COMPUTERNAME ==="
 
-$selected = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
+if ($ResumeAfterReboot.IsPresent) {
+    Write-Log "Resuming a deployment run interrupted by a mid-run reboot (Change Computer Name + Join Domain)."
 
-if ($null -eq $selected) {
-    Write-Log "User quit without installing anything."
-    exit 6
-}
-if ($selected.Count -eq 0) {
-    Write-Log "Nothing was selected. Exiting."
-    exit 6
+    # Self-unregister first, before doing anything else -- an "at logon"
+    # trigger fires on EVERY logon, not just this one, so this needs to
+    # stop existing the moment it's actually consumed, regardless of what
+    # happens next (success or failure below).
+    try {
+        Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false -ErrorAction Stop
+        Write-Log "Self-unregistered the resume scheduled task."
+    } catch {
+        Write-Log "Could not unregister the resume scheduled task (may already be gone): $($_.Exception.Message)" 'WARN'
+    }
+
+    if (-not (Test-Path -LiteralPath $script:ResumeStateFile -ErrorAction SilentlyContinue)) {
+        Write-Log "No pending-resume state file found at $script:ResumeStateFile -- nothing to resume." 'ERROR'
+        exit 6
+    }
+
+    $pendingNames = Get-Content -LiteralPath $script:ResumeStateFile -ErrorAction SilentlyContinue |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    if (-not $pendingNames -or $pendingNames.Count -eq 0) {
+        Write-Log "Pending-resume state file was empty -- nothing to resume." 'WARN'
+        Remove-Item -LiteralPath $script:ResumeStateFile -Force -ErrorAction SilentlyContinue
+        exit 6
+    }
+
+    # Look up each saved name against the (freshly rebuilt) manifest above,
+    # in the SAME order the names were saved in -- that order is already
+    # correct, since it was taken as a straight slice of the original,
+    # correctly-ordered selection.
+    $selected = @()
+    foreach ($name in $pendingNames) {
+        $match = $script:AppManifest | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if ($match) {
+            $selected += $match
+        } else {
+            Write-Log "Pending app '$name' no longer exists in the manifest -- skipping it." 'WARN'
+        }
+    }
+
+    Remove-Item -LiteralPath $script:ResumeStateFile -Force -ErrorAction SilentlyContinue
+
+    if ($selected.Count -eq 0) {
+        Write-Log "Nothing left to resume after filtering against the current manifest." 'WARN'
+        exit 6
+    }
+
+    Write-Log ("Resuming with: " + (($selected | ForEach-Object { $_.Name }) -join ', '))
+} else {
+    $selected = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
+
+    if ($null -eq $selected) {
+        Write-Log "User quit without installing anything."
+        exit 6
+    }
+    if ($selected.Count -eq 0) {
+        Write-Log "Nothing was selected. Exiting."
+        exit 6
+    }
 }
 
 $shareAccessOk = Request-ShareAccessIfNeeded -SelectedApps $selected
@@ -1013,6 +1179,7 @@ if (-not $shareAccessOk) {
 }
 
 $exitCode = Show-ProgressGui -Apps $selected -LogPath $LogPath -StagingDir $StagingDir `
-    -RepoOwner $RepoOwner -RepoName $RepoName -Branch $Branch -UseLocal:$Local.IsPresent -LocalRoot $script:LocalRoot
+    -RepoOwner $RepoOwner -RepoName $RepoName -Branch $Branch -UseLocal:$Local.IsPresent -LocalRoot $script:LocalRoot `
+    -ResumeStateFile $script:ResumeStateFile -ResumeTaskName $script:ResumeTaskName -SelfScriptPath $script:SelfScriptPath
 
 exit $exitCode
