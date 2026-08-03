@@ -17,6 +17,18 @@
     rights to join computers to the domain, so this doesn't assume the
     share credential is reusable here.
 
+    CONFIRMED IN TESTING: this used to call Get-Credential, which failed
+    with "the host program... does not support user interaction." This
+    script runs inside the background install runspace (created via
+    [runspacefactory]::CreateRunspace() in Show-ProgressGui), which gets
+    a minimal default PowerShell host with no credential-prompting
+    support -- Get-Credential depends on $Host implementing that, so it
+    can never work here regardless of the OS-level dialog underneath.
+    Fixed by building a small custom WinForms username/password dialog
+    (Show-CredentialDialog, below) instead, which doesn't depend on
+    $Host at all -- same reason ChangeComputerNameInst.ps1's InputBox
+    already worked fine from this same runspace without needing a fix.
+
     NO AUTOMATIC REBOOT: Add-Computer is called without -Restart. Domain
     join needs a restart to fully take effect (Kerberos, GPO application,
     etc.), but forcing an immediate reboot here would kill the rest of
@@ -105,7 +117,101 @@ if ($cs.PartOfDomain) {
 }
 
 Write-Log "Machine is currently in workgroup '$($cs.Domain)'. Requesting AD credentials to join $TargetDomain."
-$cred = Get-Credential -UserName 'RPSINC\' -Message "Enter AD credentials with rights to join this computer to $TargetDomain (e.g. DOMAIN\username). This is a SEPARATE credential from the file-share prompt -- domain-join rights are not the same as share-read rights."
+function Show-CredentialDialog {
+    # Get-Credential depends on $Host implementing credential-prompting
+    # support. The background runspace this script actually runs in
+    # (created via [runspacefactory]::CreateRunspace() in
+    # Show-ProgressGui) gets a minimal default host that does NOT
+    # implement that -- confirmed in testing: Get-Credential threw "the
+    # host program... does not support user interaction" here, even
+    # though the identical Get-Credential call works fine elsewhere in
+    # this project (Request-ShareAccessIfNeeded runs in the ORIGINAL
+    # runspace, before Show-ProgressGui ever creates the background one,
+    # so it never hits this). This dialog sidesteps the problem entirely
+    # by using plain WinForms, which doesn't depend on $Host at all --
+    # same reason ChangeComputerNameInst.ps1's InputBox already works
+    # fine from this same background runspace.
+    param(
+        [string]$Message,
+        [string]$DefaultUserName = 'RPSINC\'
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Domain Join Credentials'
+    $form.Size = New-Object System.Drawing.Size(430, 230)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+
+    $lblMessage = New-Object System.Windows.Forms.Label
+    $lblMessage.Text = $Message
+    $lblMessage.Location = New-Object System.Drawing.Point(15, 15)
+    $lblMessage.Size = New-Object System.Drawing.Size(390, 55)
+    $form.Controls.Add($lblMessage)
+
+    $lblUser = New-Object System.Windows.Forms.Label
+    $lblUser.Text = 'User name:'
+    $lblUser.Location = New-Object System.Drawing.Point(15, 80)
+    $lblUser.Size = New-Object System.Drawing.Size(100, 20)
+    $form.Controls.Add($lblUser)
+
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Text = $DefaultUserName
+    $txtUser.Location = New-Object System.Drawing.Point(120, 77)
+    $txtUser.Size = New-Object System.Drawing.Size(280, 20)
+    $form.Controls.Add($txtUser)
+
+    $lblPass = New-Object System.Windows.Forms.Label
+    $lblPass.Text = 'Password:'
+    $lblPass.Location = New-Object System.Drawing.Point(15, 110)
+    $lblPass.Size = New-Object System.Drawing.Size(100, 20)
+    $form.Controls.Add($lblPass)
+
+    $txtPass = New-Object System.Windows.Forms.TextBox
+    $txtPass.Location = New-Object System.Drawing.Point(120, 107)
+    $txtPass.Size = New-Object System.Drawing.Size(280, 20)
+    $txtPass.UseSystemPasswordChar = $true
+    $form.Controls.Add($txtPass)
+
+    $btnOK = New-Object System.Windows.Forms.Button
+    $btnOK.Text = 'OK'
+    $btnOK.Location = New-Object System.Drawing.Point(225, 155)
+    $btnOK.Size = New-Object System.Drawing.Size(85, 28)
+    $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Controls.Add($btnOK)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'
+    $btnCancel.Location = New-Object System.Drawing.Point(320, 155)
+    $btnCancel.Size = New-Object System.Drawing.Size(85, 28)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($btnCancel)
+
+    $form.AcceptButton = $btnOK
+    $form.CancelButton = $btnCancel
+
+    $result = $form.ShowDialog()
+    $userText = $txtUser.Text
+    $passText = $txtPass.Text
+    $form.Dispose()
+
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($userText) -or $passText.Length -eq 0) {
+        return $null
+    }
+
+    $securePass = ConvertTo-SecureString -String $passText -AsPlainText -Force
+    return New-Object System.Management.Automation.PSCredential($userText, $securePass)
+}
+
+$cred = Show-CredentialDialog -DefaultUserName 'RPSINC\' -Message "Enter AD credentials with rights to join this computer to $TargetDomain (e.g. DOMAIN\username). This is a SEPARATE credential from the file-share prompt -- domain-join rights are not the same as share-read rights."
 
 if (-not $cred) {
     Write-Log "Credential prompt was cancelled. Domain join not attempted." 'ERROR'
