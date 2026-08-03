@@ -373,6 +373,44 @@ $targets = @(
     @{ DisplayName = 'Dell Watchdog Timer';        NamePatterns = @('Dell Watchdog Timer*');      AppxSubstrings = @('Watchdog') }
 )
 
+# Checks whether a target is STILL present (via either Appx or registry)
+# after a removal was attempted. Added because "the uninstall command
+# didn't throw an error" turned out to be a much weaker guarantee than it
+# looked -- confirmed in real testing where every Dell target logged as
+# "removed successfully" but the apps were still present afterward.
+# Office already had this kind of real confirmation (it re-checks the
+# registry after running ODT); this brings the Dell targets up to the
+# same standard instead of just trusting that the command ran cleanly.
+function Test-TargetStillPresent {
+    param(
+        [Parameter(Mandatory)][string[]]$NamePatterns,
+        [Parameter(Mandatory)][string[]]$AppxSubstrings
+    )
+
+    foreach ($substring in $AppxSubstrings) {
+        $appxStillThere = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*$substring*" -and $_.Name -notlike '*CommandUpdate*' }
+        if ($appxStillThere) { return $true }
+
+        $provStillThere = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.PackageName -like "*$substring*" -and $_.PackageName -notlike '*CommandUpdate*' }
+        if ($provStillThere) { return $true }
+    }
+
+    $registryStillThere = Get-ItemProperty -Path @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    ) -ErrorAction SilentlyContinue |
+        Where-Object {
+            $dn = $_.DisplayName
+            if (-not $dn) { return $false }
+            foreach ($pattern in $NamePatterns) { if ($dn -like $pattern) { return $true } }
+            return $false
+        }
+
+    return [bool]$registryStillThere
+}
+
 $anyFailed = $false
 foreach ($t in $targets) {
     Write-Log "--- $($t.DisplayName) ---"
@@ -390,6 +428,13 @@ foreach ($t in $targets) {
         # nothing -- fall back to the registry approach.
         $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
         if (-not $ok) { $anyFailed = $true }
+    }
+
+    if (Test-TargetStillPresent -NamePatterns $t.NamePatterns -AppxSubstrings $t.AppxSubstrings) {
+        Write-Log "STILL PRESENT after the removal attempt above -- treating as a failure despite the uninstall command completing without an error." 'ERROR'
+        $anyFailed = $true
+    } else {
+        Write-Log "Confirmed gone."
     }
 }
 
