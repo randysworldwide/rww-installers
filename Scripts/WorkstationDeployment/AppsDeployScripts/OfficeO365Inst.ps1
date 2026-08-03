@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Installs Microsoft 365 (O365) Apps via the Office Deployment Tool,
-    using the pre-built configuration XML on the private network share.
+    Installs Microsoft 365 Apps for business via the Office Deployment
+    Tool, using a self-generated config XML requesting English only.
     Designed to run elevated on a single box (RWW WorkstationDeployment
     project -- see Apps-Deploy-Menu.ps1).
 
@@ -10,31 +10,32 @@
     Repo: randysworldwide/rww-installers
     Path: Scripts/WorkstationDeployment/AppsDeployScripts/OfficeO365Inst.ps1
 
-    Source files (on the private share; not hosted in this public repo):
+    Source file (on the private share; not hosted in this public repo):
 
         \\svazdfs001\systems$\Software\Microsoft\Office\MSOffice\setup.exe
-        \\svazdfs001\systems$\Software\Microsoft\Office\MSOffice\configuration-Office365-x64.xml
         (falls back to \\10.1.0.5\... if the hostname doesn't resolve)
 
-    Uses the standard, well-documented ODT command: setup.exe /configure
-    <xml>. Defaults to the x64 config -- the x86 variant
-    (configuration-Office365-x86.xml) also exists on the share if a
-    32-bit install is ever needed for a specific legacy add-in; this
-    script doesn't cover that case.
+    CHANGED FROM AN EARLIER VERSION: this used to copy the share's own
+    configuration-Office365-x64.xml. That file doesn't specify a
+    <Language> element, so the Office Deployment Tool fell back to its
+    default "MatchOS" behavior -- installing a language pack for EVERY
+    language configured on the machine (display language, keyboard
+    layouts, etc.), not just one. Confirmed in testing: multiple language
+    packs got installed when only English was wanted. Same underlying
+    issue, and same fix, as Office2021Inst.ps1 hit earlier -- this script
+    now generates its own minimal config XML at runtime requesting only
+    en-us, so only setup.exe itself still comes from the share.
 
-    NOTE ON THINGS THAT COULDN'T BE VERIFIED REMOTELY: this script can't
-    inspect the contents of configuration-Office365-x64.xml (it lives on
-    a private share this environment has no access to), so two things are
-    unconfirmed until real testing:
-      - Whether the XML points at a local/network SourcePath (fast,
-        offline-capable) or pulls fresh from Microsoft's CDN each run
-        (works, but slower and needs internet access at install time).
-      - The exact resulting Programs & Features DisplayName, which
-        varies by SKU/branding (e.g. "Microsoft 365 Apps for enterprise"
-        vs "...for business"). Detection below uses a broad "Microsoft
-        365" match as a reasonable starting guess.
+    Product ID: O365BusinessRetail (Microsoft 365 Apps for business --
+    confirmed directly, not guessed, since getting the wrong subscription
+    tier here would actually matter, unlike the language). No Channel
+    attribute is specified, so ODT uses its own default (Current) --
+    deliberately not guessing an update-cadence preference that wasn't
+    part of what was actually asked for here.
+
     ODT installs can legitimately take 10-20+ minutes depending on
-    connection speed and whether it's a fresh CDN download.
+    connection speed and whether it's a fresh CDN download (this config
+    doesn't specify a SourcePath, so it pulls from Microsoft's CDN).
 
 .PARAMETER LogPath
     Where to write this script's own log file.
@@ -42,7 +43,7 @@
 .EXITCODES
     0 = success -- Office was actually installed this run
     1 = setup.exe reported a non-zero exit code
-    2 = could not reach/copy setup.exe or the config XML from the share
+    2 = could not reach setup.exe on the share, or couldn't write the local config
     3 = not running elevated
     4 = nothing to do -- a matching Office install was already present
 #>
@@ -59,8 +60,17 @@ $SharePaths = @(
     '\\svazdfs001\systems$\Software\Microsoft\Office\MSOffice',
     '\\10.1.0.5\systems$\Software\Microsoft\Office\MSOffice'
 )
-$SetupFileName  = 'setup.exe'
-$ConfigFileName = 'configuration-Office365-x64.xml'
+$SetupFileName = 'setup.exe'
+$ConfigXml = @'
+<Configuration>
+  <Add OfficeClientEdition="64">
+    <Product ID="O365BusinessRetail">
+      <Language ID="en-us" />
+    </Product>
+  </Add>
+  <Display Level="None" AcceptEULA="TRUE" />
+</Configuration>
+'@
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -111,30 +121,30 @@ if (Test-OfficeO365Installed) {
 
 $sourceDir = $null
 foreach ($candidate in $SharePaths) {
-    $setupCandidate  = Join-Path $candidate $SetupFileName
-    $configCandidate = Join-Path $candidate $ConfigFileName
+    $setupCandidate = Join-Path $candidate $SetupFileName
     Write-Log "Checking share path: $candidate"
-    if ((Test-Path $setupCandidate -ErrorAction SilentlyContinue) -and (Test-Path $configCandidate -ErrorAction SilentlyContinue)) {
+    if (Test-Path $setupCandidate -ErrorAction SilentlyContinue) {
         $sourceDir = $candidate
-        Write-Log "Found setup.exe and $ConfigFileName at: $candidate"
+        Write-Log "Found setup.exe at: $candidate"
         break
     }
 }
 
 if (-not $sourceDir) {
-    Write-Log "Could not reach setup.exe and/or $ConfigFileName on any known share path. Checked: $($SharePaths -join ', ')" 'ERROR'
+    Write-Log "Could not reach setup.exe on any known share path. Checked: $($SharePaths -join ', ')" 'ERROR'
     exit 2
 }
 
 try {
     if (-not (Test-Path $StageDir)) { New-Item -Path $StageDir -ItemType Directory -Force | Out-Null }
     $localSetup  = Join-Path $StageDir $SetupFileName
-    $localConfig = Join-Path $StageDir $ConfigFileName
-    Write-Log "Staging files to $StageDir"
+    $localConfig = Join-Path $StageDir 'configuration-O365BusinessEnglishOnly.xml'
+    Write-Log "Staging setup.exe to $StageDir"
     Copy-Item -LiteralPath (Join-Path $sourceDir $SetupFileName) -Destination $localSetup -Force
-    Copy-Item -LiteralPath (Join-Path $sourceDir $ConfigFileName) -Destination $localConfig -Force
+    Write-Log "Writing generated English-only O365 Business config to $localConfig"
+    Set-Content -LiteralPath $localConfig -Value $ConfigXml -Encoding UTF8
 } catch {
-    Write-Log "Failed to copy install files from $sourceDir : $($_.Exception.Message)" 'ERROR'
+    Write-Log "Failed to stage setup.exe or write the config from/to $sourceDir : $($_.Exception.Message)" 'ERROR'
     exit 2
 }
 
@@ -154,7 +164,7 @@ if (Test-OfficeO365Installed) {
     Write-Log "=== Install-OfficeO365 finished. Overall success: True ==="
     exit 0
 } else {
-    Write-Log "setup.exe exited 0 but no matching install was found in the uninstall registry afterward -- detection pattern may need adjusting once the real DisplayName is known." 'WARN'
+    Write-Log "setup.exe exited 0 but no matching install was found in the uninstall registry afterward." 'WARN'
     Write-Log "=== Install-OfficeO365 finished. Overall success: True (unverified by registry) ==="
     exit 0
 }
