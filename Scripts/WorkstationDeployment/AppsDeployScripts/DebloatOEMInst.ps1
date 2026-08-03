@@ -17,57 +17,78 @@
         Device, Dell Watchdog Timer
       - Microsoft 365 / OneNote, ALL languages including en-us -- these
         come bundled on the machine itself (NOT something any script in
-        this project installs -- OfficeO365Inst.ps1's own English-only
-        config fix was a red herring for the original multi-language
-        symptom, confirmed after the fact; that fix is still kept since
-        requesting English-only explicitly is correct practice regardless).
-        REMOVED ENTIRELY, INCLUDING en-us: the pre-installed Office is a
-        DIFFERENT product from what OfficeO365Inst.ps1 explicitly installs
-        (Microsoft 365 Apps for business, en-us) -- leaving the OEM
-        pre-installed copy in place, even the English one, would mean two
-        different Office installs/licenses on the same machine. Both
-        entries are in Initial Setup and Conditional respectively, and
-        Initial Setup always runs before Conditional in the manifest
-        array, so this always clears out the pre-installed copy BEFORE
-        OfficeO365Inst.ps1 (if selected) installs the correct one fresh.
+        this project installs). REMOVED ENTIRELY, INCLUDING en-us: the
+        pre-installed Office is a DIFFERENT product from what
+        OfficeO365Inst.ps1 explicitly installs (Microsoft 365 Apps for
+        business, en-us) -- leaving even the English OEM copy in place
+        would mean two different Office installs/licenses on the same
+        machine. Both entries are in Initial Setup and Conditional
+        respectively, and Initial Setup always runs before Conditional
+        in the manifest array, so this always clears the pre-installed
+        copy out BEFORE OfficeO365Inst.ps1 (if selected) installs fresh.
 
     DELIBERATELY NOT TOUCHED, even though it also showed up in the same
     Programs & Features list -- reasoning, not an oversight:
       - Dell Command | Update for Windows Universal -- a genuinely useful
-        Dell tool, not bloat
+        Dell tool, not bloat (also explicitly excluded from the Appx
+        substring matching below, as an extra safety net)
       - Microsoft Edge -- deeply integrated into Windows; uninstalling it
         is unsupported and can break other things system-wide
       - Microsoft OneDrive -- a legitimate Microsoft 365 business tool,
         not OEM junk, and not something explicitly asked to be removed
       - Microsoft ASP.NET Core Shared Framework, VC++ Redistributable,
-        Windows Desktop Runtime (6.0 and 8.0) -- these are runtime
-        DEPENDENCIES some other installed software may need. Removing a
-        shared runtime blindly risks breaking whatever depends on it,
-        with no easy way to know what that is from here -- too risky to
-        include in an automatic removal list
+        Windows Desktop Runtime (6.0 and 8.0) -- runtime DEPENDENCIES
+        some other installed software may need; removing a shared
+        runtime blindly risks breaking whatever depends on it
       - Remote Desktop Connection -- a core Windows component (mstsc.exe),
         not a real removable app
 
-    Reuses the same registry-based uninstall approach already proven in
-    Apps-Deploy-Menu-Uninstall.ps1's Uninstall-ByRegistryMatch: finds the
-    Programs & Features entry matching a given DisplayName pattern, and
-    either converts a plain MsiExec call to a silent /X, or -- for
-    anything else (increasingly common for modern Dell utilities, which
-    are often packaged as MSIX/AppX rather than classic MSI) -- runs
-    whatever's already registered as the uninstall command, verbatim.
-    That's the exact same action Windows itself would take if someone
-    clicked "Uninstall" on that entry in Programs & Features, so it
-    should work reasonably reliably regardless of packaging format.
+    CONFIRMED IN TESTING, TWO SEPARATE ISSUES FOUND AND FIXED:
+      1. The Dell apps: an earlier version only tried the registry
+         UninstallString approach, which resulted in an interactive
+         confirmation window needing a manual click on every machine --
+         not actually silent. Root cause: Dell's modern OOBE utilities
+         (SupportAssist, Optimizer, Core Services, Trusted Device,
+         Watchdog Timer) are commonly packaged as MSIX/AppX apps, and
+         their registered Programs & Features "Uninstall" command often
+         just launches a small GUI wrapper that shows its own
+         confirmation dialog regardless of switches passed to it. Fixed
+         by trying Appx removal FIRST (Uninstall-AppxIfPresent, using
+         Get-AppxPackage/Remove-AppxPackage and
+         Get-AppxProvisionedPackage/Remove-AppxProvisionedPackage) --
+         genuinely silent/headless by design, no window ever shown --
+         falling back to the registry approach (Uninstall-ByRegistryMatch)
+         only if nothing matches as Appx.
+      2. Office/OneNote: ALSO confirmed NOT silent -- invoking the
+         registered OfficeC2RClient.exe uninstall command directly showed
+         an interactive "Uninstall" button, and another confirmation
+         click after each one finished, for every language variant. The
+         original assumption that Office's own registered uninstall
+         command is silent by design was WRONG. Fixed by moving
+         Office/OneNote removal entirely off the registry approach and
+         onto the Office Deployment Tool itself (Remove-AllOfficeViaODT,
+         below) -- the same setup.exe already used by OfficeO365Inst.ps1
+         and Office2021Inst.ps1 -- using a <Remove All="True" />
+         configuration. Genuinely silent (Display Level="None"), and
+         conveniently removes every installed Office language/product in
+         ONE pass rather than needing to enumerate each one separately.
 
-    SAME PROTECTED-NAME GUARD as the test uninstaller, carried over as
-    defense in depth even though none of the narrow patterns below would
-    ever plausibly match it: ScreenConnect Client (or anything else
-    providing remote access to the machine) is never touched, regardless
-    of what any pattern matches.
+    Because of fix #2, this now needs access to the same private share
+    setup.exe as the Office install scripts -- see NeedsShareCredentials
+    in the manifest entry for this app.
 
-    Anything not found is silently skipped, not treated as an error --
-    Dell's bundled software mix (or which Office languages ship
-    preloaded) could change in a future OEM image revision.
+    SAFETY: "Dell Command Update" is explicitly excluded from the Appx
+    substring matching (on top of already not appearing in the
+    NamePatterns list at all), so it can never be accidentally caught
+    even by a loose substring match. Same PROTECTED-NAME guard as the
+    test uninstaller is carried over for the registry fallback path too
+    (ScreenConnect Client, or anything else providing remote access, is
+    never touched regardless of what any pattern matches).
+
+    Anything not found (via any of the strategies above) is silently
+    skipped, not treated as an error -- Dell's bundled software mix (or
+    which Office languages ship preloaded, or whether a given app is
+    Appx-packaged at all) could change in a future OEM image revision.
 
 .PARAMETER LogPath
     Where to write this script's own log file.
@@ -75,7 +96,10 @@
 .EXITCODES
     0 = success -- ran through the full list; anything found was removed
         (or was already absent, which isn't a failure)
-    1 = one or more removal attempts were found but failed
+    1 = one or more removal attempts were found but failed -- this now
+        also covers the Office ODT step if setup.exe couldn't be reached
+        on the share, or if setup.exe ran but Office/OneNote entries were
+        still present in the registry afterward
     3 = not running elevated
 #>
 
@@ -114,18 +138,64 @@ if (-not (Test-IsElevated)) {
 
 $script:ProtectedNamePatterns = @('*ScreenConnect*')
 
+# ---------------------------------------------------------------------------
+# Strategy 1: Appx removal -- genuinely silent, no window ever shown.
+# Returns @{ Found = <bool>; Ok = <bool> } so the caller knows both
+# whether anything matched AND whether removal actually succeeded.
+# ---------------------------------------------------------------------------
+function Uninstall-AppxIfPresent {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string[]]$AppxSubstrings
+    )
+
+    $foundAny  = $false
+    $failedAny = $false
+
+    foreach ($substring in $AppxSubstrings) {
+        $pkgs = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*$substring*" -and $_.Name -notlike '*CommandUpdate*' }
+        foreach ($pkg in $pkgs) {
+            $foundAny = $true
+            Write-Log "Found Appx package for '$DisplayName': $($pkg.PackageFullName)"
+            try {
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                Write-Log "Removed Appx package: $($pkg.PackageFullName)"
+            } catch {
+                Write-Log "Failed to remove Appx package $($pkg.PackageFullName): $($_.Exception.Message)" 'ERROR'
+                $failedAny = $true
+            }
+        }
+
+        $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.PackageName -like "*$substring*" -and $_.PackageName -notlike '*CommandUpdate*' }
+        foreach ($prov in $provisioned) {
+            $foundAny = $true
+            Write-Log "Found provisioned Appx package for '$DisplayName': $($prov.PackageName)"
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null
+                Write-Log "Removed provisioned Appx package (so it won't reappear for a future user profile): $($prov.PackageName)"
+            } catch {
+                Write-Log "Failed to remove provisioned Appx package $($prov.PackageName): $($_.Exception.Message)" 'ERROR'
+                $failedAny = $true
+            }
+        }
+    }
+
+    return @{ Found = $foundAny; Ok = (-not $failedAny) }
+}
+
+# ---------------------------------------------------------------------------
+# Strategy 2 (fallback): registry UninstallString approach, same as the
+# test uninstaller's Uninstall-ByRegistryMatch, with best-effort silent
+# switches appended for anything that isn't a recognizable MsiExec call.
+# ---------------------------------------------------------------------------
 function Uninstall-ByRegistryMatch {
     param(
         [Parameter(Mandatory)][string]$DisplayName,
         [Parameter(Mandatory)][string[]]$NamePatterns
     )
-    Write-Log "--- $DisplayName ---"
 
-    # Finds ALL matches, not just the first -- some patterns here (e.g.
-    # "Microsoft 365 - *") are deliberately broad enough to match multiple
-    # distinct entries at once (one per pre-installed language), and all
-    # of them need to actually be removed, not just whichever one the
-    # registry query happens to return first.
     $allMatches = @(Get-ItemProperty -Path @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -138,11 +208,11 @@ function Uninstall-ByRegistryMatch {
         })
 
     if ($allMatches.Count -eq 0) {
-        Write-Log "Not found -- nothing to remove." 'WARN'
+        Write-Log "Not found in the uninstall registry either -- nothing to remove." 'WARN'
         return $true
     }
 
-    Write-Log "Found $($allMatches.Count) matching entr$(if ($allMatches.Count -eq 1) {'y'} else {'ies'}): $(($allMatches | ForEach-Object { $_.DisplayName }) -join ', ')"
+    Write-Log "Found $($allMatches.Count) matching registry entr$(if ($allMatches.Count -eq 1) {'y'} else {'ies'}): $(($allMatches | ForEach-Object { $_.DisplayName }) -join ', ')"
 
     $overallOk = $true
     foreach ($uninstallKey in $allMatches) {
@@ -163,7 +233,7 @@ function Uninstall-ByRegistryMatch {
         if ($isProtected) { continue }
 
         $uninstallString = $uninstallKey.UninstallString
-        Write-Log "Removing '$($uninstallKey.DisplayName)'. Uninstall string: $uninstallString"
+        Write-Log "Removing '$($uninstallKey.DisplayName)' via registry. Uninstall string: $uninstallString"
 
         if ($uninstallString -match 'MsiExec\.exe\s*/[IX]\{([0-9A-Fa-f\-]+)\}') {
             $productCode = "{$($Matches[1])}"
@@ -177,9 +247,17 @@ function Uninstall-ByRegistryMatch {
                 $overallOk = $false
             }
         } else {
-            Write-Log "Not a recognizable MsiExec call -- running the registered uninstall string as-is (best effort)." 'WARN'
+            # UNVERIFIED best-effort: appending common silent-switch
+            # conventions since the vendor's actual switch (if any) isn't
+            # known. Most installers ignore switches they don't
+            # recognize, but that's not guaranteed for every tool. Office
+            # doesn't go through this path at all anymore -- see
+            # Remove-AllOfficeViaODT below, since this registry approach
+            # turned out NOT to be silent for Office in real testing.
+            $silentAttempt = "$uninstallString /S /silent /quiet /norestart"
+            Write-Log "Not a recognizable MsiExec call -- trying with common silent switches appended (unverified, best effort): $silentAttempt" 'WARN'
             try {
-                Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$uninstallString`"" -Wait -NoNewWindow -ErrorAction Stop
+                Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$silentAttempt`"" -Wait -NoNewWindow -ErrorAction Stop
                 Write-Log "Uninstall command completed."
             } catch {
                 Write-Log "Uninstall command failed: $($_.Exception.Message)" 'ERROR'
@@ -191,23 +269,132 @@ function Uninstall-ByRegistryMatch {
     return $overallOk
 }
 
+# ---------------------------------------------------------------------------
+# Office/OneNote removal: NOT via the registry approach above. Confirmed
+# in real testing that invoking the registered OfficeC2RClient.exe
+# uninstall command directly (Strategy 2's original approach) is NOT
+# silent -- it shows an interactive "Uninstall" button, and another
+# confirmation click after it finishes, on every single language variant.
+# The actual Microsoft-documented way to silently remove Click-to-Run
+# Office is through the Office Deployment Tool itself (the same setup.exe
+# already used by OfficeO365Inst.ps1 and Office2021Inst.ps1), using a
+# <Remove All="True" /> configuration -- this also conveniently removes
+# every installed language/product in ONE pass, rather than needing to
+# enumerate each one separately.
+# ---------------------------------------------------------------------------
+function Test-AnyOfficeClickToRunInstalled {
+    $hives = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($hive in $hives) {
+        $match = Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Microsoft 365 - *' -or $_.DisplayName -like 'Microsoft OneNote - *' }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+function Remove-AllOfficeViaODT {
+    Write-Log "--- Microsoft 365 / OneNote (all pre-installed languages, via ODT) ---"
+
+    if (-not (Test-AnyOfficeClickToRunInstalled)) {
+        Write-Log "No pre-installed Office/OneNote Click-to-Run entries found -- nothing to remove." 'WARN'
+        return $true
+    }
+
+    $stageDir   = "$env:ProgramData\Dev\AppsDeploy\DebloatOfficeRemoval"
+    $sharePaths = @(
+        '\\svazdfs001\systems$\Software\Microsoft\Office\MSOffice',
+        '\\10.1.0.5\systems$\Software\Microsoft\Office\MSOffice'
+    )
+    $setupFileName = 'setup.exe'
+    $configXml = @'
+<Configuration>
+  <Remove All="True" />
+  <Display Level="None" AcceptEULA="TRUE" />
+</Configuration>
+'@
+
+    $sourceDir = $null
+    foreach ($candidate in $sharePaths) {
+        $setupCandidate = Join-Path $candidate $setupFileName
+        Write-Log "Checking share path: $candidate"
+        if (Test-Path $setupCandidate -ErrorAction SilentlyContinue) {
+            $sourceDir = $candidate
+            Write-Log "Found setup.exe at: $candidate"
+            break
+        }
+    }
+
+    if (-not $sourceDir) {
+        Write-Log "Could not reach setup.exe on any known share path. Checked: $($sharePaths -join ', ')" 'ERROR'
+        return $false
+    }
+
+    try {
+        if (-not (Test-Path $stageDir)) { New-Item -Path $stageDir -ItemType Directory -Force | Out-Null }
+        $localSetup  = Join-Path $stageDir $setupFileName
+        $localConfig = Join-Path $stageDir 'configuration-RemoveAllOffice.xml'
+        Write-Log "Staging setup.exe to $stageDir"
+        Copy-Item -LiteralPath (Join-Path $sourceDir $setupFileName) -Destination $localSetup -Force
+        Write-Log "Writing generated Remove-All config to $localConfig"
+        Set-Content -LiteralPath $localConfig -Value $configXml -Encoding UTF8
+    } catch {
+        Write-Log "Failed to stage setup.exe or write the config from/to ${sourceDir}: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    Write-Log "Running: $localSetup /configure $localConfig (silent, may take a few minutes)"
+    $proc = Start-Process -FilePath $localSetup -ArgumentList "/configure `"$localConfig`"" -Wait -PassThru -NoNewWindow
+    Write-Log "setup.exe exit code: $($proc.ExitCode)"
+
+    if ($proc.ExitCode -ne 0) {
+        Write-Log "ODT remove-all FAILED (exit code $($proc.ExitCode))." 'ERROR'
+        return $false
+    }
+
+    if (Test-AnyOfficeClickToRunInstalled) {
+        Write-Log "setup.exe exited 0 but an Office/OneNote entry is still present in the registry afterward." 'WARN'
+        return $false
+    }
+
+    Write-Log "Confirmed no Office/OneNote Click-to-Run entries remain."
+    return $true
+}
+
 Write-Log "=== Install-DebloatOEM starting on $env:COMPUTERNAME ==="
 
 $targets = @(
-    @{ DisplayName = 'Dell Core Services';                              NamePatterns = @('Dell Core Services') }
-    @{ DisplayName = 'Dell Optimizer';                                  NamePatterns = @('Dell Optimizer*') }
-    @{ DisplayName = 'Dell SupportAssist (and related entries)';        NamePatterns = @('Dell SupportAssist*') }
-    @{ DisplayName = 'Dell Trusted Device';                             NamePatterns = @('Dell Trusted Device') }
-    @{ DisplayName = 'Dell Watchdog Timer';                             NamePatterns = @('Dell Watchdog Timer*') }
-    @{ DisplayName = 'Microsoft 365 (all pre-installed languages, including en-us)';   NamePatterns = @('Microsoft 365 - *') }
-    @{ DisplayName = 'Microsoft OneNote (all pre-installed languages, including en-us)'; NamePatterns = @('Microsoft OneNote - *') }
+    @{ DisplayName = 'Dell Core Services';        NamePatterns = @('Dell Core Services');       AppxSubstrings = @('CoreServices') }
+    @{ DisplayName = 'Dell Optimizer';             NamePatterns = @('Dell Optimizer*');           AppxSubstrings = @('Optimizer') }
+    @{ DisplayName = 'Dell SupportAssist (and related entries)'; NamePatterns = @('Dell SupportAssist*'); AppxSubstrings = @('SupportAssist') }
+    @{ DisplayName = 'Dell Trusted Device';        NamePatterns = @('Dell Trusted Device');       AppxSubstrings = @('TrustedDevice') }
+    @{ DisplayName = 'Dell Watchdog Timer';        NamePatterns = @('Dell Watchdog Timer*');      AppxSubstrings = @('Watchdog') }
 )
 
 $anyFailed = $false
 foreach ($t in $targets) {
-    $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
-    if (-not $ok) { $anyFailed = $true }
+    Write-Log "--- $($t.DisplayName) ---"
+
+    $appxResult = @{ Found = $false; Ok = $true }
+    if ($t.AppxSubstrings.Count -gt 0) {
+        $appxResult = Uninstall-AppxIfPresent -DisplayName $t.DisplayName -AppxSubstrings $t.AppxSubstrings
+        if (-not $appxResult.Ok) { $anyFailed = $true }
+    }
+
+    if ($appxResult.Found) {
+        Write-Log "Removed via Appx -- skipping the registry-based fallback for this one."
+    } else {
+        # Either not Appx-packaged at all, or the Appx check found
+        # nothing -- fall back to the registry approach.
+        $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
+        if (-not $ok) { $anyFailed = $true }
+    }
 }
+
+$officeOk = Remove-AllOfficeViaODT
+if (-not $officeOk) { $anyFailed = $true }
 
 if ($anyFailed) {
     Write-Log "One or more removals failed. See errors above." 'ERROR'
