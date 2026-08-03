@@ -133,31 +133,67 @@ if (-not $sourceDir) {
     exit 2
 }
 
-try {
-    if (Test-Path $StageDir) { Remove-Item -Path $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -Path $StageDir -ItemType Directory -Force | Out-Null
+$criticalSiblingFile = 'program files\Zultys\ZAC\register_x64.vbs'
+$stagingAttempts = 3
+$stagedOk = $false
 
-    # ZAC.msi is a "compressed MSI" that also relies on some files stored
-    # UNCOMPRESSED alongside it (e.g. register_x64.vbs, under a
-    # "program files\Zultys\ZAC\" subfolder relative to the MSI's own
-    # location) -- copying only ZAC.msi itself fails with a 1309/1603 error
-    # because those sibling files are missing. Stage the whole source
-    # folder as a unit instead, same reasoning as AcroProInst.ps1.
-    Write-Log "Staging entire ZAC source folder to $StageDir (ZAC.msi relies on sibling uncompressed files, not just the bare MSI)"
-    Get-ChildItem -LiteralPath $sourceDir -Recurse | ForEach-Object {
-        $relativePath = $_.FullName.Substring($sourceDir.Length).TrimStart('\')
-        $destPath = Join-Path $StageDir $relativePath
-        if ($_.PSIsContainer) {
-            if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
-        } else {
-            $destParent = Split-Path -Path $destPath -Parent
-            if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
-            Copy-Item -LiteralPath $_.FullName -Destination $destPath -Force
+for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
+    try {
+        if (Test-Path $StageDir) { Remove-Item -Path $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -Path $StageDir -ItemType Directory -Force | Out-Null
+
+        # ZAC.msi is a "compressed MSI" that also relies on some files
+        # stored UNCOMPRESSED alongside it (e.g. register_x64.vbs, under a
+        # "program files\Zultys\ZAC\" subfolder relative to the MSI's own
+        # location) -- copying only ZAC.msi itself fails with a 1309/1603
+        # error because those sibling files are missing. Stage the whole
+        # source folder as a unit instead, same reasoning as
+        # AcroProInst.ps1.
+        Write-Log "Staging entire ZAC source folder to $StageDir (attempt $stageAttempt/$stagingAttempts) -- ZAC.msi relies on sibling uncompressed files, not just the bare MSI"
+
+        # -ErrorAction Stop on BOTH calls below is deliberate: confirmed in
+        # testing that Get-ChildItem/Copy-Item can silently skip an
+        # individual file or subfolder they have trouble reading (a
+        # non-terminating error that our try/catch would never see
+        # otherwise), leaving an INCOMPLETE local copy with no warning at
+        # all -- the install then fails later with an opaque msiexec 1603
+        # that gives no hint the real problem was an incomplete copy.
+        # Forcing these to Stop means any such problem becomes a real,
+        # caught, retriable error instead of a silent gap.
+        Get-ChildItem -LiteralPath $sourceDir -Recurse -ErrorAction Stop | ForEach-Object {
+            $relativePath = $_.FullName.Substring($sourceDir.Length).TrimStart('\')
+            $destPath = Join-Path $StageDir $relativePath
+            if ($_.PSIsContainer) {
+                if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
+            } else {
+                $destParent = Split-Path -Path $destPath -Parent
+                if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
+                Copy-Item -LiteralPath $_.FullName -Destination $destPath -Force -ErrorAction Stop
+            }
+        }
+
+        # Explicit sanity check: confirmed in testing that the copy loop
+        # above can complete with no exception at all, yet this specific
+        # file still be missing locally afterward -- verify it directly
+        # rather than assuming "no exception" means "complete copy".
+        $localSiblingCheck = Join-Path $StageDir $criticalSiblingFile
+        if (-not (Test-Path -LiteralPath $localSiblingCheck)) {
+            throw "Staging completed without error, but $criticalSiblingFile is still missing locally afterward."
+        }
+
+        $localMsi = Join-Path $StageDir $MsiFileName
+        $stagedOk = $true
+        break
+    } catch {
+        Write-Log "Staging attempt $stageAttempt/$stagingAttempts failed: $($_.Exception.Message)" 'WARN'
+        if ($stageAttempt -lt $stagingAttempts) {
+            Start-Sleep -Seconds 5
         }
     }
-    $localMsi = Join-Path $StageDir $MsiFileName
-} catch {
-    Write-Log "Failed to stage the ZAC source folder from $sourceDir : $($_.Exception.Message)" 'ERROR'
+}
+
+if (-not $stagedOk) {
+    Write-Log "Failed to stage a complete ZAC source folder from $sourceDir after $stagingAttempts attempts -- giving up before attempting msiexec (an incomplete copy would just fail with an opaque error anyway)." 'ERROR'
     exit 2
 }
 
