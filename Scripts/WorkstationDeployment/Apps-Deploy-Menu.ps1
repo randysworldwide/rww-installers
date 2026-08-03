@@ -241,6 +241,10 @@ $script:AppManifest = @(
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/SentinelOneInst.ps1'
        NeedsShareCredentials = $true
        Note = "Pulls its MSI and site token from the private share. The token is a secret and is never logged." }
+    @{ Name = 'RPS Reporting Center Shortcuts';  Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ReportingCenterInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Not a software install -- copies two RDP shortcuts to the Public desktop, visible to all users. Skips if both already exist." }
 
     # --- Conditional ---
     @{ Name = 'Office O365';                     Category = 'Conditional';   DefaultOn = $true;  Status = 'Ready';
