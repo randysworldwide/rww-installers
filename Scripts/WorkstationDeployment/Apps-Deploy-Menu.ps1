@@ -279,7 +279,8 @@ $script:AppManifest = @(
        Note = "Prompts for its OWN AD credentials, separate from the file-share prompt -- domain-join rights aren't the same as share-read rights. No auto-restart; a manual restart is needed afterward for it to fully take effect." }
     @{ Name = 'Remove OEM Bloatware';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DebloatOEMInst.ps1'
-       Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer and ALL pre-installed Office/OneNote (every language, including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
+       NeedsShareCredentials = $true
+       Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer (via Appx) and ALL pre-installed Office/OneNote (via ODT Remove-All, every language including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
     @{ Name = 'ConnectWise Agent';              Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CWAgentInst.ps1'
        NeedsShareCredentials = $true
