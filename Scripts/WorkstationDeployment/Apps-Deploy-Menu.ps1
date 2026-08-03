@@ -765,6 +765,28 @@ function Show-ProgressGui {
             Write-WorkerLog "=== Apps-Deploy-Menu install run starting ==="
             Write-WorkerLog ("Selected: " + (($Apps | ForEach-Object { $_.Name }) -join ', '))
 
+            # If both Change Computer Name and Join Domain are selected in
+            # the SAME run, they need to coordinate: renaming a machine
+            # takes a restart to actually apply, and joining a domain
+            # before that restart would create the AD computer object
+            # under the OLD name -- a mismatch that isn't simple to
+            # correct after the fact. Rather than each script guessing
+            # whether the other one is also running, decide it once here
+            # (this is the only place with full visibility into the whole
+            # selected list) and share the answer via Global scope, the
+            # same pattern already used for $Global:RWWLogSink. When both
+            # are selected, ChangeComputerNameInst.ps1 defers the actual
+            # rename and DomainJoinInst.ps1 applies rename+join together
+            # in one Add-Computer call -- the Microsoft-documented correct
+            # way to do both at once.
+            $Global:RWWCombineRenameAndJoin = [bool](
+                ($Apps | Where-Object { $_.Name -eq 'Change Computer Name' }) -and
+                ($Apps | Where-Object { $_.Name -eq 'Join Domain (rpsinc.ringpinion.com)' })
+            )
+            if ($Global:RWWCombineRenameAndJoin) {
+                Write-WorkerLog "Both 'Change Computer Name' and 'Join Domain' are selected -- they'll coordinate to rename+join in a single combined step."
+            }
+
             $results = @()
             $i = 0
             foreach ($app in $Apps) {
