@@ -30,12 +30,28 @@
     purposes), letters/digits/hyphens only, can't start or end with a
     hyphen, and can't be all-digits.
 
+    COORDINATION WITH JOIN DOMAIN: renaming takes a restart to actually
+    apply, and joining a domain before that restart would create the AD
+    computer object under the OLD name -- a mismatch that isn't simple to
+    correct after the fact. If Join Domain is ALSO selected in the same
+    run (checked via $Global:RWWCombineRenameAndJoin, set once by
+    Apps-Deploy-Menu.ps1 before any app in the run starts, since it's the
+    only place with visibility into the whole selected list), this script
+    does NOT call Rename-Computer at all -- it just records the desired
+    name to a state file
+    (C:\ProgramData\Dev\AppsDeploy\PendingComputerName.txt) and lets
+    DomainJoinInst.ps1 apply the rename and the join together in a single
+    Add-Computer call, the Microsoft-documented correct way to do both at
+    once. If Join Domain is NOT also selected, this behaves exactly as
+    before -- renames immediately, no state file involved.
+
 .PARAMETER LogPath
     Where to write this script's own log file.
 
 .EXITCODES
-    0 = success -- name was changed this run (restart still needed to
-        fully take effect, but that's expected, not a failure)
+    0 = success -- either name was changed this run, or the rename was
+        successfully deferred to Join Domain (both are treated as success
+        so the run summary doesn't show a false failure)
     1 = Rename-Computer failed
     2 = the entered name failed validation
     3 = not running elevated
@@ -101,6 +117,24 @@ $isValid = ($newName -match '^[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?$') -an
 if (-not $isValid) {
     Write-Log "'$newName' failed validation -- must be 1-15 characters, letters/digits/hyphens only, can't start/end with a hyphen, can't be all digits." 'ERROR'
     exit 2
+}
+
+$pendingNamePath = "$env:ProgramData\Dev\AppsDeploy\PendingComputerName.txt"
+
+if ($Global:RWWCombineRenameAndJoin) {
+    Write-Log "Join Domain is also selected this run -- deferring the actual rename to it instead of renaming now, so both apply together in one Add-Computer call."
+    try {
+        $dir = Split-Path -Path $pendingNamePath -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        Set-Content -LiteralPath $pendingNamePath -Value $newName -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to write the pending-name state file: $($_.Exception.Message)" 'ERROR'
+        Write-Log "=== Install-ChangeComputerName finished. Overall success: False ===" 
+        exit 1
+    }
+    Write-Log "Recorded '$newName' as the pending name for Join Domain to apply."
+    Write-Log "=== Install-ChangeComputerName finished. Overall success: True (rename deferred to Join Domain) ==="
+    exit 0
 }
 
 try {
