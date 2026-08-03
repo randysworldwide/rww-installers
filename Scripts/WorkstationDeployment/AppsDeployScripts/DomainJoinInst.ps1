@@ -44,6 +44,21 @@
     riskier operation than a fresh join and isn't attempted here -- it
     fails loudly (exit 5) instead, requiring manual handling.
 
+    COORDINATION WITH CHANGE COMPUTER NAME: if that entry is ALSO
+    selected in the same run, ChangeComputerNameInst.ps1 defers the
+    actual rename to this script instead of applying it directly (see
+    its own header for why -- renaming needs a restart to take effect,
+    and joining before that restart would create the AD computer object
+    under the OLD name). This script checks for that deferred name at
+    C:\ProgramData\Dev\AppsDeploy\PendingComputerName.txt and, if
+    present, passes it to Add-Computer's own -NewName parameter so both
+    happen together in one call -- the Microsoft-documented correct way
+    to rename and join at once. If the join itself then fails for any
+    other reason (bad credentials, unreachable DC, etc.), this still
+    falls back to applying the plain rename on its own before exiting,
+    so a failed join doesn't silently swallow the rename that was
+    actually requested.
+
     Because of the ordering note in Apps-Deploy-Menu.ps1's manifest
     ("apps run in the order listed, so a dependency should be listed
     before anything that needs it"), this is deliberately the FIRST
@@ -103,20 +118,55 @@ if (-not (Test-IsElevated)) {
 
 Write-Log "=== Install-DomainJoin starting on $env:COMPUTERNAME ==="
 
+$pendingNamePath = "$env:ProgramData\Dev\AppsDeploy\PendingComputerName.txt"
+$pendingName = $null
+if (Test-Path -LiteralPath $pendingNamePath -ErrorAction SilentlyContinue) {
+    try {
+        $pendingName = (Get-Content -LiteralPath $pendingNamePath -Raw -ErrorAction Stop).Trim()
+        if ([string]::IsNullOrWhiteSpace($pendingName)) { $pendingName = $null }
+    } catch {
+        Write-Log "Found a pending-name file but couldn't read it: $($_.Exception.Message)" 'WARN'
+    }
+}
+if ($pendingName) {
+    Write-Log "Found a pending computer name from Change Computer Name: '$pendingName'."
+}
+
 $cs = Get-CimInstance -ClassName Win32_ComputerSystem
 if ($cs.PartOfDomain) {
     if ($cs.Domain -eq $TargetDomain) {
-        Write-Log "Already joined to $TargetDomain. Skipping."
+        Write-Log "Already joined to $TargetDomain. Skipping the join itself."
+        if ($pendingName) {
+            Write-Log "A rename to '$pendingName' was still pending -- applying it on its own since there's no join to combine it with." 'WARN'
+            try {
+                Rename-Computer -NewName $pendingName -Force -ErrorAction Stop
+                Write-Log "Rename to '$pendingName' succeeded (requires a restart to take effect)."
+                Remove-Item -LiteralPath $pendingNamePath -Force -ErrorAction SilentlyContinue
+                Write-Log "=== Install-DomainJoin finished. Overall success: True (rename applied, restart pending) ==="
+                exit 0
+            } catch {
+                Write-Log "Rename failed: $($_.Exception.Message)" 'ERROR'
+                Write-Log "=== Install-DomainJoin finished. Overall success: False ==="
+                exit 1
+            }
+        }
         Write-Log "Nothing was done -- domain join was already present." 'WARN'
         exit 4
     } else {
         Write-Log "Machine is joined to a DIFFERENT domain ($($cs.Domain)), not $TargetDomain." 'ERROR'
         Write-Log "Refusing to attempt an automatic domain migration -- this needs manual handling (unjoin, then rejoin, or a deliberate migration process)." 'ERROR'
+        if ($pendingName) {
+            Write-Log "A rename to '$pendingName' is also still pending -- left untouched given the domain mismatch above needs manual handling anyway." 'WARN'
+        }
         exit 5
     }
 }
 
 Write-Log "Machine is currently in workgroup '$($cs.Domain)'. Requesting AD credentials to join $TargetDomain."
+if ($pendingName) {
+    Write-Log "Will rename to '$pendingName' and join together in one step."
+}
+
 function Show-CredentialDialog {
     # Get-Credential depends on $Host implementing credential-prompting
     # support. The background runspace this script actually runs in
@@ -219,15 +269,37 @@ if (-not $cred) {
 }
 
 try {
-    Write-Log "Running Add-Computer -DomainName $TargetDomain (no auto-restart -- see script header for why)"
-    Add-Computer -DomainName $TargetDomain -Credential $cred -Force -ErrorAction Stop
+    if ($pendingName) {
+        Write-Log "Running Add-Computer -DomainName $TargetDomain -NewName $pendingName (combined rename+join, no auto-restart -- see script header for why)"
+        Add-Computer -DomainName $TargetDomain -NewName $pendingName -Credential $cred -Force -ErrorAction Stop
+    } else {
+        Write-Log "Running Add-Computer -DomainName $TargetDomain (no auto-restart -- see script header for why)"
+        Add-Computer -DomainName $TargetDomain -Credential $cred -Force -ErrorAction Stop
+    }
 } catch {
     Write-Log "Domain join FAILED: $($_.Exception.Message)" 'ERROR'
+
+    if ($pendingName) {
+        Write-Log "A rename to '$pendingName' was also pending as part of this combined step. Falling back to applying just the rename on its own, so it isn't silently lost." 'WARN'
+        try {
+            Rename-Computer -NewName $pendingName -Force -ErrorAction Stop
+            Write-Log "Fallback rename to '$pendingName' succeeded (still requires a restart to take effect)."
+            Remove-Item -LiteralPath $pendingNamePath -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log "Fallback rename also failed: $($_.Exception.Message)" 'ERROR'
+        }
+    }
+
     Write-Log "=== Install-DomainJoin finished. Overall success: False ==="
     exit 1
 }
 
-Write-Log "Domain join succeeded."
-Write-Log "A RESTART IS REQUIRED for this to fully take effect (Kerberos, GPO, etc.) -- not done automatically here so the rest of this deployment run can continue. Restart this machine when convenient." 'WARN'
+if ($pendingName) {
+    Remove-Item -LiteralPath $pendingNamePath -Force -ErrorAction SilentlyContinue
+    Write-Log "Domain join and rename to '$pendingName' both succeeded together."
+} else {
+    Write-Log "Domain join succeeded."
+}
+Write-Log "A RESTART IS REQUIRED for this to fully take effect (Kerberos, GPO, new name, etc.) -- not done automatically here so the rest of this deployment run can continue. Restart this machine when convenient." 'WARN'
 Write-Log "=== Install-DomainJoin finished. Overall success: True (restart pending) ==="
 exit 0
