@@ -1179,8 +1179,14 @@ function Show-ProgressGui {
     $barCurrent.Location = New-Object System.Drawing.Point(15, 40)
     $barCurrent.Size = New-Object System.Drawing.Size(1240, 24)
     $barCurrent.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-    $barCurrent.Style = 'Marquee'
-    $barCurrent.MarqueeAnimationSpeed = 30
+    # NOT using the native 'Marquee' style here -- see the Timer.Tick
+    # handler below for why. Continuous style + a manually-driven bounce
+    # gives the same "actively working" visual without relying on the
+    # native marquee's own separate internal animation mechanism.
+    $barCurrent.Style = 'Continuous'
+    $barCurrent.Minimum = 0
+    $barCurrent.Maximum = 100
+    $barCurrent.Value = 0
     $form.Controls.Add($barCurrent)
 
     $lblOverall = New-Object System.Windows.Forms.Label
@@ -1223,44 +1229,66 @@ function Show-ProgressGui {
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 150
+    $script:barDirection = 1
     $timer.Add_Tick({
-        $line = $null
-        $appended = $false
-        while ($logQueue.TryDequeue([ref]$line)) {
-            $txtLog.AppendText($line + "`r`n")
-            $appended = $true
-        }
-        if ($appended) {
-            $txtLog.SelectionStart = $txtLog.Text.Length
-            $txtLog.ScrollToCaret()
-        }
-
-        if ($state.Index -gt 0) {
-            $lblCurrent.Text = "Installing: $($state.CurrentApp)"
-            $lblOverall.Text = "App $($state.Index) of $($state.Total)"
-        }
-
-        if ($state.AppDone) {
-            $barCurrent.Style = 'Continuous'
-            $barCurrent.Maximum = 100
-            $barCurrent.Value = 100
-            $barOverall.Value = [Math]::Min($state.Index, $barOverall.Maximum)
-        } elseif ($barCurrent.Style -ne 'Marquee') {
-            $barCurrent.Style = 'Marquee'
-        }
-
-        if ($state.AllDone) {
-            $timer.Stop()
-            if ($state.FinalExitCode -eq 0) {
-                $lblCurrent.Text = 'All selected apps finished successfully.'
-            } else {
-                $lblCurrent.Text = 'Finished with one or more failures -- see log above.'
-                $lblCurrent.ForeColor = [System.Drawing.Color]::Firebrick
+        try {
+            $line = $null
+            $appended = $false
+            while ($logQueue.TryDequeue([ref]$line)) {
+                $txtLog.AppendText($line + "`r`n")
+                $appended = $true
             }
-            $barCurrent.Style = 'Continuous'
-            $barCurrent.Value = 100
-            $barOverall.Value = $barOverall.Maximum
-            $btnClose.Enabled = $true
+            if ($appended) {
+                $txtLog.SelectionStart = $txtLog.Text.Length
+                $txtLog.ScrollToCaret()
+            }
+
+            if ($state.Index -gt 0) {
+                $lblCurrent.Text = "Installing: $($state.CurrentApp)"
+                $lblOverall.Text = "App $($state.Index) of $($state.Total)"
+            }
+
+            if ($state.AppDone) {
+                $barCurrent.Value = 100
+                $barOverall.Value = [Math]::Min($state.Index, $barOverall.Maximum)
+            } else {
+                # Manually-driven bounce instead of the native 'Marquee'
+                # style -- see the ProgressBar setup above for why. Simple
+                # back-and-forth sweep between 0 and 100, driven by this
+                # same reliable timer rather than a separate native
+                # animation mechanism.
+                $next = $barCurrent.Value + (5 * $script:barDirection)
+                if ($next -ge 100) { $next = 100; $script:barDirection = -1 }
+                if ($next -le 0) { $next = 0; $script:barDirection = 1 }
+                $barCurrent.Value = $next
+            }
+
+            if ($state.AllDone) {
+                $timer.Stop()
+                if ($state.FinalExitCode -eq 0) {
+                    $lblCurrent.Text = 'All selected apps finished successfully.'
+                } else {
+                    $lblCurrent.Text = 'Finished with one or more failures -- see log above.'
+                    $lblCurrent.ForeColor = [System.Drawing.Color]::Firebrick
+                }
+                $barCurrent.Value = 100
+                $barOverall.Value = $barOverall.Maximum
+                $btnClose.Enabled = $true
+            }
+        } catch {
+            # Defensive only -- an unhandled exception here could
+            # otherwise silently stop this Timer (and therefore the
+            # entire visible progress display) without any indication
+            # why, which is indistinguishable from a real freeze to
+            # whoever's watching. Swallowing and continuing keeps the
+            # display alive even if one tick's update has a problem;
+            # written directly to a fixed path (not through Write-Log)
+            # since if the UI layer itself is having trouble, that's
+            # exactly the wrong moment to depend on more UI-thread state.
+            try {
+                Add-Content -Path "$env:ProgramData\Dev\AppsDeploy\Logs\Apps-Deploy-Menu-GuiTimerErrors.log" `
+                    -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $($_.Exception.Message)" -ErrorAction SilentlyContinue
+            } catch {}
         }
     })
     $timer.Start()
