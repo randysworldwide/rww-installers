@@ -193,7 +193,8 @@ function Uninstall-AppxIfPresent {
 function Uninstall-ByRegistryMatch {
     param(
         [Parameter(Mandatory)][string]$DisplayName,
-        [Parameter(Mandatory)][string[]]$NamePatterns
+        [Parameter(Mandatory)][string[]]$NamePatterns,
+        [string]$IssSharePath = ''
     )
 
     $allMatches = @(Get-ItemProperty -Path @(
@@ -237,31 +238,90 @@ function Uninstall-ByRegistryMatch {
 
         if ($uninstallString -match 'MsiExec\.exe\s*/[IX]\{([0-9A-Fa-f\-]+)\}') {
             $productCode = "{$($Matches[1])}"
-            Write-Log "Running: msiexec /X $productCode /quiet /norestart"
-            $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/X $productCode /quiet /norestart" -Wait -PassThru -NoNewWindow
-            if ($proc.ExitCode -in @(0, 1605, 3010, 1641)) {
+
+            # Retry-with-backoff on 1618 (another Windows Installer
+            # operation is in progress) -- CONFIRMED IN TESTING: Dell
+            # Core Services hit this removing several Dell components in
+            # quick succession, which is exactly the scenario this
+            # matters for. Same pattern already proven in
+            # CWAgentInst.ps1's Install-CWAgentOnce -- this function just
+            # never had it, since it wasn't originally expected to fire
+            # several MSI removals back-to-back the way it now does.
+            $maxAttempts = 4
+            $delaySeconds = 15
+            $msiexecExitCode = -1
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                Write-Log "Running (attempt $attempt/$maxAttempts): msiexec /X $productCode /quiet /norestart"
+                $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/X $productCode /quiet /norestart" -Wait -PassThru -NoNewWindow
+                $msiexecExitCode = $proc.ExitCode
+                if ($msiexecExitCode -eq 1618 -and $attempt -lt $maxAttempts) {
+                    Write-Log "msiexec busy (1618) -- waiting ${delaySeconds}s then retrying." 'WARN'
+                    Start-Sleep -Seconds $delaySeconds
+                    $delaySeconds = [Math]::Min($delaySeconds + 15, 60)
+                    continue
+                }
+                break
+            }
+
+            if ($msiexecExitCode -in @(0, 1605, 3010, 1641)) {
                 # 1605 = "not installed" (already gone), 3010/1641 = reboot pending -- both fine
-                Write-Log "Removed successfully (exit $($proc.ExitCode))."
+                Write-Log "Removed successfully (exit $msiexecExitCode)."
             } else {
-                Write-Log "msiexec exit $($proc.ExitCode) -- treating as failure." 'ERROR'
+                Write-Log "msiexec exit $msiexecExitCode -- treating as failure." 'ERROR'
                 $overallOk = $false
             }
         } else {
-            # UNVERIFIED best-effort: appending common silent-switch
-            # conventions since the vendor's actual switch (if any) isn't
-            # known. Most installers ignore switches they don't
-            # recognize, but that's not guaranteed for every tool. Office
-            # doesn't go through this path at all anymore -- see
-            # Remove-AllOfficeViaODT below, since this registry approach
-            # turned out NOT to be silent for Office in real testing.
-            $silentAttempt = "$uninstallString /S /silent /quiet /norestart"
-            Write-Log "Not a recognizable MsiExec call -- trying with common silent switches appended (unverified, best effort): $silentAttempt" 'WARN'
-            try {
-                Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$silentAttempt`"" -Wait -NoNewWindow -ErrorAction Stop
-                Write-Log "Uninstall command completed."
-            } catch {
-                Write-Log "Uninstall command failed: $($_.Exception.Message)" 'ERROR'
-                $overallOk = $false
+            $issAttempted = $false
+
+            # InstallShield's OWN documented silent-uninstall mechanism
+            # for a generic setup.exe/bootstrapper requires a PRE-RECORDED
+            # response file (.iss) -- there's no simple flag combination
+            # that achieves true silence without one. CONFIRMED IN TWO
+            # SEPARATE REAL TESTS: the blind-switch fallback below does
+            # NOT work for Dell Optimizer's InstallShield-wrapped
+            # uninstaller (completes without error, but doesn't actually
+            # remove it). If a recorded .iss file has been placed on the
+            # share for this specific target, use it for a genuinely
+            # silent removal instead of guessing.
+            if ($IssSharePath) {
+                Write-Log "A recorded .iss response file is configured for this target -- trying that first for genuine silence: $IssSharePath"
+                try {
+                    if (Test-Path -LiteralPath $IssSharePath -ErrorAction Stop) {
+                        $localIssDir = "$env:ProgramData\Dev\AppsDeploy\IssFiles"
+                        if (-not (Test-Path $localIssDir)) { New-Item -Path $localIssDir -ItemType Directory -Force | Out-Null }
+                        $localIssPath = Join-Path $localIssDir (Split-Path -Path $IssSharePath -Leaf)
+                        Copy-Item -LiteralPath $IssSharePath -Destination $localIssPath -Force -ErrorAction Stop
+
+                        $issAttempt = "$uninstallString -s -f1`"$localIssPath`""
+                        Write-Log "Running with recorded response file: $issAttempt"
+                        Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$issAttempt`"" -Wait -NoNewWindow -ErrorAction Stop
+                        Write-Log "Uninstall command (with .iss response file) completed."
+                        $issAttempted = $true
+                    } else {
+                        Write-Log "Configured .iss path doesn't exist on the share yet -- falling back to the guessed-switch attempt below." 'WARN'
+                    }
+                } catch {
+                    Write-Log "Running with the .iss response file failed: $($_.Exception.Message) -- falling back to the guessed-switch attempt below." 'WARN'
+                }
+            }
+
+            if (-not $issAttempted) {
+                # UNVERIFIED best-effort: appending common silent-switch
+                # conventions since the vendor's actual switch (if any) isn't
+                # known. Most installers ignore switches they don't
+                # recognize, but that's not guaranteed for every tool. Office
+                # doesn't go through this path at all anymore -- see
+                # Remove-AllOfficeViaODT below, since this registry approach
+                # turned out NOT to be silent for Office in real testing.
+                $silentAttempt = "$uninstallString /S /silent /quiet /norestart"
+                Write-Log "Not a recognizable MsiExec call -- trying with common silent switches appended (unverified, best effort): $silentAttempt" 'WARN'
+                try {
+                    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$silentAttempt`"" -Wait -NoNewWindow -ErrorAction Stop
+                    Write-Log "Uninstall command completed."
+                } catch {
+                    Write-Log "Uninstall command failed: $($_.Exception.Message)" 'ERROR'
+                    $overallOk = $false
+                }
             }
         }
     }
@@ -367,7 +427,7 @@ Write-Log "=== Install-DebloatOEM starting on $env:COMPUTERNAME ==="
 
 $targets = @(
     @{ DisplayName = 'Dell Core Services';        NamePatterns = @('Dell Core Services');       AppxSubstrings = @('CoreServices') }
-    @{ DisplayName = 'Dell Optimizer';             NamePatterns = @('Dell Optimizer*');           AppxSubstrings = @('Optimizer') }
+    @{ DisplayName = 'Dell Optimizer';             NamePatterns = @('Dell Optimizer*');           AppxSubstrings = @('Optimizer'); IssSharePath = '\\svazdfs001\systems$\Software\Dell\DellOptimizerUninstall.iss' }
     @{ DisplayName = 'Dell SupportAssist (and related entries)'; NamePatterns = @('Dell SupportAssist*'); AppxSubstrings = @('SupportAssist') }
     @{ DisplayName = 'Dell Trusted Device';        NamePatterns = @('Dell Trusted Device');       AppxSubstrings = @('TrustedDevice') }
     @{ DisplayName = 'Dell Watchdog Timer';        NamePatterns = @('Dell Watchdog Timer*');      AppxSubstrings = @('Watchdog') }
@@ -428,7 +488,8 @@ foreach ($t in $targets) {
     # whenever Appx found something, which meant the Appx piece got
     # removed but the separate legacy entry never even got attempted.
     # Always try both now, regardless of what the other one found.
-    $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns
+    $issPath = if ($t.ContainsKey('IssSharePath')) { $t.IssSharePath } else { '' }
+    $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns -IssSharePath $issPath
     if (-not $ok) { $anyFailed = $true }
 
     if (Test-TargetStillPresent -NamePatterns $t.NamePatterns -AppxSubstrings $t.AppxSubstrings) {
