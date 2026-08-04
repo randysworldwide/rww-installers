@@ -136,7 +136,22 @@ try {
 Write-Log "Running: $localExe /S (unverified switch -- see script header)"
 $proc = Start-Process -FilePath $localExe -ArgumentList '/S' -PassThru -NoNewWindow
 
-if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+# Polling instead of a blocking WaitForExit() call -- confirmed via real
+# testing on ZACInst.ps1 that raw Process.WaitForExit() on an STA thread
+# (the background install runspace is correctly STA) can freeze that
+# thread's own message pump if the launched process creates any window,
+# even a hidden/silent one, that communicates back via window messages --
+# a real risk here given /S is an unverified guess and this could easily
+# end up sitting at an actual GUI prompt. Start-Sleep doesn't carry the
+# same message-pump requirement.
+$elapsedSeconds = 0
+$pollIntervalSeconds = 2
+while (-not $proc.HasExited -and $elapsedSeconds -lt $TimeoutSeconds) {
+    Start-Sleep -Seconds $pollIntervalSeconds
+    $elapsedSeconds += $pollIntervalSeconds
+}
+
+if (-not $proc.HasExited) {
     Write-Log "Installer did not exit within $TimeoutSeconds seconds -- almost certainly means /S wasn't accepted and it's waiting at a GUI prompt. Killing it." 'ERROR'
     try { $proc.Kill() } catch {}
     Write-Log "=== Install-MXAdmin finished. Overall success: False (timeout) ==="
