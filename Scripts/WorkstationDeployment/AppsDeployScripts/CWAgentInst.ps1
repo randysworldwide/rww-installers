@@ -30,44 +30,63 @@
     deploying a monitoring agent to a machine with no network path to
     corporate resources isn't a meaningful scenario anyway.
 
-    CONFIRMED IN TESTING -- THE "GHOST AGENT" ISSUE: msiexec can report a
-    clean success and LTService can exist as a running Windows service,
-    while the agent never actually shows up in Programs & Features, the
-    system tray, or the Automate console -- effectively invisible despite
-    "installing" successfully. Per ConnectWise's own community-documented
-    troubleshooting (and general knowledge of how the LabTech/Automate
-    agent works): the MSI itself is really just a bootstrap step -- it
-    installs LTService, and THAT service is what actually phones home to
-    the Automate server afterward to complete real provisioning (device
-    registration, tray icon, and the full Programs & Features entry). If
-    that phone-home step fails, or the server has a stale/conflicting
-    record for this machine already, the agent can get stuck in this
-    half-installed state indefinitely. The known manual fix is to
-    uninstall, then reinstall fresh -- this script now automates that same
-    cycle rather than declaring success based on the service alone.
-    FLAGGING HONESTLY: the exact phone-home mechanism and timing are
-    inferred from general knowledge and community reports, not something
-    directly confirmed for this specific instance's server behavior.
+    CONFIRMED IN TESTING -- THE "GHOST AGENT" ISSUE, ROOT CAUSE NOW KNOWN:
+    msiexec can report a clean success and LTService can exist as a
+    running Windows service, while the agent never actually shows up in
+    Programs & Features, the system tray, or the Automate console --
+    effectively invisible despite "installing" successfully. A real
+    LTErrors.txt from an affected machine confirmed the exact cause:
+
+        SecureChannelFailure : The request was aborted: Could not create
+        SSL/TLS secure channel.
+
+    on the agent's own sign-up request to the Automate server. LTService
+    is a .NET Framework 4.x application (confirmed via "INIT CLR:
+    4.0.30319" in its own log), and .NET 4.x apps don't automatically use
+    TLS 1.2 unless the OS/.NET is explicitly configured to defer to it --
+    a factory-fresh machine has likely never had anything apply that
+    configuration. The agent installs and starts fine (that's a local
+    file operation), but every sign-up/registration attempt then fails at
+    the TLS handshake step, before ever meaningfully reaching the
+    Automate server -- which is exactly why a full local uninstall /
+    reboot / reinstall cycle alone did NOT fix it on a real test: the
+    actual problem was never local to the install process at all.
+
+    FIXED via Enable-DotNetStrongTls (below): sets the standard,
+    Microsoft-documented SchUseStrongCrypto + SystemDefaultTlsVersions
+    registry values for the .NET Framework 4.x runtime, in both the
+    64-bit and WOW6432Node hives. This makes .NET defer TLS negotiation
+    to Windows' own SChannel component (which supports TLS 1.2+ on any
+    reasonably current Windows build) instead of using .NET's own
+    outdated hardcoded protocol list. This is a general .NET Framework
+    fix, not anything ConnectWise-specific, and is applied unconditionally
+    and idempotently before every install/repair attempt.
+
+    The uninstall-then-reinstall "ghost agent" repair cycle below is kept
+    as a secondary safety net (e.g. for a genuinely stuck Windows
+    Installer state), but the TLS fix above is the actual confirmed root
+    cause fix for the specific symptom reported and diagnosed here.
 
     Steps:
       1. Skip only if the agent is BOTH running (LTService exists) AND
          fully registered (a matching Programs & Features entry exists) --
          checking the service alone would incorrectly treat a stuck ghost
          install from an earlier run as "already done" and never repair it.
-      2. Copy both files from the network share to a local staging folder
+      2. Apply the .NET strong-TLS registry fix (see above).
+      3. Copy both files from the network share to a local staging folder
          (so a flaky share connection can't interrupt an in-progress
          install, same reasoning as the Cisco Secure Client script staging
          to $env:TEMP).
-      3. msiexec /i <msi> TRANSFORMS=<mst> /quiet /norestart
+      4. msiexec /i <msi> TRANSFORMS=<mst> /quiet /norestart
          REBOOT=ReallySuppress /lvx* <log>, with retry/backoff on exit code
          1618 (installer mutex held), same pattern as
          Scripts/SecureConnect/Install-SecureClient-Automate.ps1.
-      4. After a successful msiexec exit, wait up to 90 seconds (checking
+      5. After a successful msiexec exit, wait up to 90 seconds (checking
          every 15) for the Programs & Features entry to appear -- giving
          the service time to complete its own phone-home registration
          before judging the install. This wait duration is a reasonable
          guess, not measured against real registration timing data.
-      5. If still not registered after that wait, automatically repair:
+      6. If still not registered after that wait, automatically repair:
          uninstall via the local MSI file (falling back to directly
          stopping/deleting the LTService service if Windows Installer
          itself doesn't think anything needs removing -- a real
@@ -139,6 +158,47 @@ function Test-IsElevated {
 if (-not (Test-IsElevated)) {
     Write-Log "Not running elevated. Re-run as administrator." 'ERROR'
     exit 3
+}
+
+# ---------------------------------------------------------------------------
+# CONFIRMED ROOT CAUSE (via LTErrors.txt on a real ghost-agent machine):
+# "WebRqst: https://.../LabTech/agent.aspx : SecureChannelFailure : Could
+# not create SSL/TLS secure channel." LTService is a .NET Framework 4.x
+# app (confirmed via "INIT CLR:4.0.30319" in its own log) -- .NET 4.x apps
+# don't automatically use TLS 1.2 unless the OS/.NET is explicitly told to
+# defer to it, and a factory-fresh machine has likely never had anything
+# apply that configuration. The agent installs and starts fine (it's a
+# local file operation), but every single sign-up/registration attempt
+# then fails at the TLS handshake step before it ever reaches the
+# Automate server meaningfully -- which is exactly why a full local
+# uninstall/reboot/reinstall cycle didn't help: the actual problem was
+# never local to begin with.
+#
+# Standard, well-documented Microsoft fix (not specific to ConnectWise):
+# set SchUseStrongCrypto + SystemDefaultTlsVersions for the .NET Framework
+# 4.x runtime, in both the 64-bit and WOW6432Node hives (LTService's
+# architecture isn't guaranteed, so both are covered). This makes .NET
+# defer TLS negotiation to Windows' own SChannel component, which
+# supports TLS 1.2+ on any reasonably current Windows build, instead of
+# using .NET's own outdated hardcoded protocol list. Applied unconditionally
+# and idempotently here, before any install/repair attempt, so both the
+# initial try and the repair-retry cycle below benefit from it.
+# ---------------------------------------------------------------------------
+function Enable-DotNetStrongTls {
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319'
+    )
+    foreach ($key in $keys) {
+        try {
+            if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+            Set-ItemProperty -Path $key -Name 'SchUseStrongCrypto' -Value 1 -Type DWord -ErrorAction Stop
+            Set-ItemProperty -Path $key -Name 'SystemDefaultTlsVersions' -Value 1 -Type DWord -ErrorAction Stop
+            Write-Log "Set SchUseStrongCrypto/SystemDefaultTlsVersions=1 under $key"
+        } catch {
+            Write-Log "Failed to set strong-TLS registry values under ${key}: $($_.Exception.Message)" 'WARN'
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -222,6 +282,9 @@ function Uninstall-CWAgentForRepair {
 # Main
 # ---------------------------------------------------------------------------
 Write-Log "=== Install-CWAgent starting on $env:COMPUTERNAME ==="
+
+Write-Log "Applying the .NET Framework strong-TLS fix (SecureChannelFailure root cause confirmed via LTErrors.txt on a real test machine -- see script header for details)."
+Enable-DotNetStrongTls
 
 $serviceExists   = Test-CWAgentServiceExists
 $fullyRegistered = if ($serviceExists) { Test-CWAgentFullyRegistered } else { $false }
