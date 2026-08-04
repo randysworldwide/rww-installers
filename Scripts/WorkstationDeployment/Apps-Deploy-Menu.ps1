@@ -630,97 +630,6 @@ function Show-SelectionGui {
 # runspace so the window stays responsive, and polls a thread-safe queue to
 # stream each script's log lines into the textbox live.
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Some apps' install scripts pull their installer files from
-# \\svazdfs001\systems$ (or its \\10.1.0.5 IP fallback) -- a domain file
-# share. If this menu is run under a LOCAL account rather than a domain
-# account (e.g. a local Administrator account, as happened during testing),
-# Windows has no cached credential for that share and every one of those
-# installs fails with a "could not reach" error, even though the files are
-# genuinely there.
-#
-# This prompts for AD credentials once, up front, but ONLY if at least one
-# of the SELECTED apps actually needs the share (checked via each app's
-# NeedsShareCredentials manifest flag) -- apps that don't touch the share
-# never trigger this prompt. It then establishes an authenticated SMB
-# session via `net use` before any installs run.
-#
-# That session is cached at the Windows logon-session level, not per
-# process, so it's automatically available to the background install
-# runspace too (same process, same access token) without needing to pass
-# credentials into each individual app script -- none of the 9 app scripts
-# that use the share needed any changes for this to work.
-# ---------------------------------------------------------------------------
-# Returns $true if share access was established (or wasn't needed at all),
-# $false if none of the selected apps need it -- wait, that's also $true.
-# Returns $false ONLY when at least one selected app needs the share and
-# every credential attempt failed -- the caller treats that as fatal and
-# aborts the whole run rather than proceeding into installs that are
-# guaranteed to fail.
-function Request-ShareAccessIfNeeded {
-    param([Parameter(Mandatory)][array]$SelectedApps)
-
-    $needsShare = @($SelectedApps | Where-Object { $_.NeedsShareCredentials })
-    if ($needsShare.Count -eq 0) {
-        return $true
-    }
-
-    $appNames = ($needsShare | ForEach-Object { $_.Name }) -join ', '
-    Write-Log "The following selected apps need access to \\svazdfs001\systems`$: $appNames"
-
-    $sharePaths  = @('\\svazdfs001\systems$', '\\10.1.0.5\systems$')
-    $maxAttempts = 3
-
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        $cred = Get-Credential -UserName 'RPSINC\' -Message "Enter AD credentials (e.g. DOMAIN\username) with access to \\svazdfs001\systems$ -- needed for: $appNames"
-        if (-not $cred) {
-            Write-Log "Credential prompt was cancelled (attempt $attempt/$maxAttempts)." 'WARN'
-            continue
-        }
-
-        $anySucceeded = $false
-        foreach ($path in $sharePaths) {
-            try {
-                # Drop any existing session to this target first -- Windows
-                # won't let you reconnect with different credentials to a
-                # UNC target it's already connected to, which matters on a
-                # retry after a mistyped password.
-                Start-Process -FilePath 'net.exe' -ArgumentList @('use', $path, '/delete', '/y') `
-                    -Wait -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
-
-                $netUseArgs = @('use', $path, "/user:$($cred.UserName)", $cred.GetNetworkCredential().Password, '/persistent:no')
-                $proc = Start-Process -FilePath 'net.exe' -ArgumentList $netUseArgs -Wait -PassThru -NoNewWindow
-                if ($proc.ExitCode -eq 0) {
-                    Write-Log "Authenticated to $path successfully."
-                    $anySucceeded = $true
-                } else {
-                    Write-Log "Could not authenticate to $path (net use exit $($proc.ExitCode))." 'WARN'
-                }
-            } catch {
-                Write-Log "Error attempting to authenticate to $path : $($_.Exception.Message)" 'WARN'
-            }
-        }
-
-        if ($anySucceeded) {
-            return $true
-        }
-
-        Write-Log "Credential attempt $attempt/$maxAttempts failed for both share paths." 'WARN'
-    }
-
-    $failMessage = "Could not establish access to \\svazdfs001\systems$ after $maxAttempts attempts (wrong credentials, cancelled, or the share is genuinely unreachable). Aborting -- selected apps needing the share ($appNames) would only fail anyway."
-    Write-Log $failMessage 'ERROR'
-
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show(
-        $failMessage, 'rww-installers - Share access failed',
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    ) | Out-Null
-
-    return $false
-}
-
 function Show-ProgressGui {
     param(
         [Parameter(Mandatory)][array]$Apps,
@@ -779,6 +688,168 @@ function Show-ProgressGui {
                 if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
                 Add-Content -Path $LogPath -Value $line
             } catch {}
+        }
+
+        # Deferred, just-in-time share-credential prompting. This used to
+        # run once up front in Main, before any app in the run even
+        # started -- meaning a tech got prompted for share credentials
+        # immediately, then had to sit through Enable Administrator
+        # Account, Change Computer Name, Join Domain (including its own
+        # separate credential prompt and the mid-run reboot it can
+        # trigger), and Remove OEM Bloatware before the share access was
+        # actually used for anything. Moved here so it only fires right
+        # before the FIRST app in the remaining queue that actually needs
+        # it -- which naturally also handles the mid-run reboot case
+        # correctly on its own: the resumed session is a fresh process,
+        # so its own net use session doesn't exist yet either, and this
+        # will correctly re-prompt right before whichever remaining app
+        # needs it first, with no special-casing required.
+        #
+        # Uses a custom WinForms dialog, not Get-Credential -- this runs
+        # inside the background install runspace (created via
+        # [runspacefactory]::CreateRunspace() in Show-ProgressGui), which
+        # gets a minimal default PowerShell host with no credential-
+        # prompting support. Get-Credential depends on $Host implementing
+        # that and fails here with "the host program... does not support
+        # user interaction" -- confirmed in testing for the identical
+        # issue in DomainJoinInst.ps1. This dialog doesn't depend on
+        # $Host at all, so it works fine from this same runspace.
+        function Show-ShareCredentialDialog {
+            param([string]$Message)
+
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+
+            $form = New-Object System.Windows.Forms.Form
+            $form.Text = 'Network Share Credentials'
+            $form.Size = New-Object System.Drawing.Size(430, 230)
+            $form.StartPosition = 'CenterScreen'
+            $form.FormBorderStyle = 'FixedDialog'
+            $form.MaximizeBox = $false
+            $form.MinimizeBox = $false
+            $form.TopMost = $true
+
+            $lblMessage = New-Object System.Windows.Forms.Label
+            $lblMessage.Text = $Message
+            $lblMessage.Location = New-Object System.Drawing.Point(15, 15)
+            $lblMessage.Size = New-Object System.Drawing.Size(390, 55)
+            $form.Controls.Add($lblMessage)
+
+            $lblUser = New-Object System.Windows.Forms.Label
+            $lblUser.Text = 'User name:'
+            $lblUser.Location = New-Object System.Drawing.Point(15, 80)
+            $lblUser.Size = New-Object System.Drawing.Size(100, 20)
+            $form.Controls.Add($lblUser)
+
+            $txtUser = New-Object System.Windows.Forms.TextBox
+            $txtUser.Text = 'RPSINC\'
+            $txtUser.Location = New-Object System.Drawing.Point(120, 77)
+            $txtUser.Size = New-Object System.Drawing.Size(280, 20)
+            $form.Controls.Add($txtUser)
+
+            $lblPass = New-Object System.Windows.Forms.Label
+            $lblPass.Text = 'Password:'
+            $lblPass.Location = New-Object System.Drawing.Point(15, 110)
+            $lblPass.Size = New-Object System.Drawing.Size(100, 20)
+            $form.Controls.Add($lblPass)
+
+            $txtPass = New-Object System.Windows.Forms.TextBox
+            $txtPass.Location = New-Object System.Drawing.Point(120, 107)
+            $txtPass.Size = New-Object System.Drawing.Size(280, 20)
+            $txtPass.UseSystemPasswordChar = $true
+            $form.Controls.Add($txtPass)
+
+            $btnOK = New-Object System.Windows.Forms.Button
+            $btnOK.Text = 'OK'
+            $btnOK.Location = New-Object System.Drawing.Point(225, 155)
+            $btnOK.Size = New-Object System.Drawing.Size(85, 28)
+            $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Controls.Add($btnOK)
+
+            $btnCancel = New-Object System.Windows.Forms.Button
+            $btnCancel.Text = 'Cancel'
+            $btnCancel.Location = New-Object System.Drawing.Point(320, 155)
+            $btnCancel.Size = New-Object System.Drawing.Size(85, 28)
+            $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+            $form.Controls.Add($btnCancel)
+
+            $form.AcceptButton = $btnOK
+            $form.CancelButton = $btnCancel
+
+            $result = $form.ShowDialog()
+            $userText = $txtUser.Text
+            $passText = $txtPass.Text
+            $form.Dispose()
+
+            if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+                return $null
+            }
+            if ([string]::IsNullOrWhiteSpace($userText) -or $passText.Length -eq 0) {
+                return $null
+            }
+
+            $securePass = ConvertTo-SecureString -String $passText -AsPlainText -Force
+            return New-Object System.Management.Automation.PSCredential($userText, $securePass)
+        }
+
+        function Request-ShareAccessIfNeededInWorker {
+            param([Parameter(Mandatory)][array]$SelectedApps)
+
+            $needsShare = @($SelectedApps | Where-Object { $_.NeedsShareCredentials })
+            if ($needsShare.Count -eq 0) {
+                return $true
+            }
+
+            $appNames = ($needsShare | ForEach-Object { $_.Name }) -join ', '
+            Write-WorkerLog "The following remaining app(s) need access to \\svazdfs001\systems`$: $appNames"
+
+            $sharePaths  = @('\\svazdfs001\systems$', '\\10.1.0.5\systems$')
+            $maxAttempts = 3
+
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                $cred = Show-ShareCredentialDialog -Message "Enter AD credentials (e.g. DOMAIN\username) with access to \\svazdfs001\systems$ -- needed for: $appNames"
+                if (-not $cred) {
+                    Write-WorkerLog "Credential prompt was cancelled (attempt $attempt/$maxAttempts)." 'WARN'
+                    continue
+                }
+
+                $anySucceeded = $false
+                foreach ($path in $sharePaths) {
+                    try {
+                        Start-Process -FilePath 'net.exe' -ArgumentList @('use', $path, '/delete', '/y') `
+                            -Wait -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
+
+                        $netUseArgs = @('use', $path, "/user:$($cred.UserName)", $cred.GetNetworkCredential().Password, '/persistent:no')
+                        $proc = Start-Process -FilePath 'net.exe' -ArgumentList $netUseArgs -Wait -PassThru -NoNewWindow
+                        if ($proc.ExitCode -eq 0) {
+                            Write-WorkerLog "Authenticated to $path successfully."
+                            $anySucceeded = $true
+                        } else {
+                            Write-WorkerLog "Could not authenticate to $path (net use exit $($proc.ExitCode))." 'WARN'
+                        }
+                    } catch {
+                        Write-WorkerLog "Error attempting to authenticate to $path : $($_.Exception.Message)" 'WARN'
+                    }
+                }
+
+                if ($anySucceeded) {
+                    return $true
+                }
+
+                Write-WorkerLog "Credential attempt $attempt/$maxAttempts failed for both share paths." 'WARN'
+            }
+
+            $failMessage = "Could not establish access to \\svazdfs001\systems$ after $maxAttempts attempts (wrong credentials, cancelled, or the share is genuinely unreachable). Aborting -- remaining apps needing the share ($appNames) would only fail anyway."
+            Write-WorkerLog $failMessage 'ERROR'
+
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show(
+                $failMessage, 'rww-installers - Share access failed',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+
+            return $false
         }
 
         function Invoke-RemoteInstallScript {
@@ -859,6 +930,7 @@ function Show-ProgressGui {
 
             $results = @()
             $i = 0
+            $shareCredentialsHandled = $false
             foreach ($app in $Apps) {
                 $i++
                 $StateRef.Index = $i
@@ -867,6 +939,22 @@ function Show-ProgressGui {
 
                 Write-WorkerLog ""
                 Write-WorkerLog "--- $($app.Name) ($i of $($Apps.Count)) ---"
+
+                if ($app.NeedsShareCredentials -and -not $shareCredentialsHandled) {
+                    $shareCredentialsHandled = $true
+                    # Include the CURRENT app in the "who needs this"
+                    # message, not just what comes after it -- $i is
+                    # already this app's own 1-based position at this
+                    # point in the loop, so ($i-1) is its 0-based index.
+                    $upcomingShareApps = @($Apps[($i - 1)..($Apps.Count - 1)] | Where-Object { $_.NeedsShareCredentials })
+                    $shareOk = Request-ShareAccessIfNeededInWorker -SelectedApps $upcomingShareApps
+                    if (-not $shareOk) {
+                        Write-WorkerLog "Aborting run -- share credentials could not be established. See error above." 'ERROR'
+                        $StateRef.FinalExitCode = 7
+                        $StateRef.AllDone = $true
+                        break
+                    }
+                }
 
                 $code = Invoke-RemoteInstallScript -RepoPath $app.InstallRepoPath
                 $ok = ($code -eq 0 -or $code -eq 4)   # 4 = "already installed", per existing scripts' convention
@@ -913,6 +1001,36 @@ function Show-ProgressGui {
                         } catch {
                             Write-WorkerLog "Failed to set up automatic resume: $($_.Exception.Message)" 'ERROR'
                             Write-WorkerLog "The remaining apps listed above will need to be selected manually after restarting." 'ERROR'
+                        }
+
+                        # Skip the manual "press Enter at the lock screen"
+                        # step for a passwordless throwaway account, ONLY
+                        # for this one reboot cycle. Deliberately narrow
+                        # and self-cleaning: this is the OPPOSITE of the
+                        # AutoAdminLogon DISABLE in RemoveThrowawayAccountInst.ps1
+                        # (which exists specifically because AutoAdminLogon
+                        # racing against that task's "at startup" trigger
+                        # was a confirmed real bug) -- enabling it here is
+                        # safe specifically because it gets disabled again
+                        # immediately when the resumed session starts back
+                        # up (see the -ResumeAfterReboot handling in Main),
+                        # before continuing with the rest of the queue.
+                        # That keeps the passwordless auto-login window
+                        # open for exactly one reboot cycle, regardless of
+                        # whether Remove Throwaway Setup Account is even
+                        # selected in this run -- it never lingers on the
+                        # machine afterward.
+                        try {
+                            $winlogonKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+                            Set-ItemProperty -Path $winlogonKey -Name 'AutoAdminLogon' -Value '1' -ErrorAction Stop
+                            Set-ItemProperty -Path $winlogonKey -Name 'DefaultUserName' -Value $env:USERNAME -ErrorAction Stop
+                            # No DefaultPassword set -- the throwaway
+                            # account has no password, and Windows
+                            # correctly auto-logs-on with a blank password
+                            # when the target account genuinely has none.
+                            Write-WorkerLog "Enabled a one-time auto-login as '$env:USERNAME' for this reboot only (will be disabled again immediately on resume)."
+                        } catch {
+                            Write-WorkerLog "Could not enable auto-login for this reboot -- the lock screen will need a manual Enter press as before: $($_.Exception.Message)" 'WARN'
                         }
 
                         Write-WorkerLog "Restarting in 20 seconds..." 'WARN'
@@ -1119,6 +1237,20 @@ Write-Log "=== Apps-Deploy-Menu starting on $env:COMPUTERNAME ==="
 if ($ResumeAfterReboot.IsPresent) {
     Write-Log "Resuming a deployment run interrupted by a mid-run reboot (Change Computer Name + Join Domain)."
 
+    # Close the one-time auto-login window immediately -- it was enabled
+    # for exactly this one reboot cycle (see the worker script's
+    # combined-reboot block), and needs to be turned back off right away
+    # regardless of whether Remove Throwaway Setup Account is even
+    # selected in this run, so a passwordless auto-login never lingers on
+    # the machine longer than the single reboot it was needed for.
+    try {
+        $winlogonKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        Set-ItemProperty -Path $winlogonKey -Name 'AutoAdminLogon' -Value '0' -ErrorAction Stop
+        Write-Log "Disabled the one-time auto-login now that it's served its purpose."
+    } catch {
+        Write-Log "Could not disable auto-login after resuming (non-fatal, but worth checking manually): $($_.Exception.Message)" 'WARN'
+    }
+
     # Self-unregister first, before doing anything else -- an "at logon"
     # trigger fires on EVERY logon, not just this one, so this needs to
     # stop existing the moment it's actually consumed, regardless of what
@@ -1177,12 +1309,6 @@ if ($ResumeAfterReboot.IsPresent) {
         Write-Log "Nothing was selected. Exiting."
         exit 6
     }
-}
-
-$shareAccessOk = Request-ShareAccessIfNeeded -SelectedApps $selected
-if (-not $shareAccessOk) {
-    Write-Log "Aborting run -- share credentials could not be established. See error above."
-    exit 7
 }
 
 $exitCode = Show-ProgressGui -Apps $selected -LogPath $LogPath -StagingDir $StagingDir `
