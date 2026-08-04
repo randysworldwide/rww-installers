@@ -133,7 +133,20 @@ try {
 Write-Log "Running: $localExe (Microsoft's standard silent-by-default per-app C2R installer, no flags needed)"
 $proc = Start-Process -FilePath $localExe -PassThru -NoNewWindow
 
-if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+# Polling instead of a blocking WaitForExit() call -- confirmed via real
+# testing on ZACInst.ps1 that raw Process.WaitForExit() on an STA thread
+# (the background install runspace is correctly STA) can freeze that
+# thread's own message pump if the launched process creates any window,
+# even a hidden/silent one, that communicates back via window messages.
+# Start-Sleep doesn't carry the same message-pump requirement.
+$elapsedSeconds = 0
+$pollIntervalSeconds = 2
+while (-not $proc.HasExited -and $elapsedSeconds -lt $TimeoutSeconds) {
+    Start-Sleep -Seconds $pollIntervalSeconds
+    $elapsedSeconds += $pollIntervalSeconds
+}
+
+if (-not $proc.HasExited) {
     Write-Log "Installer did not exit within $TimeoutSeconds seconds. Killing it." 'ERROR'
     try { $proc.Kill() } catch {}
     Write-Log "=== Install-OutlookClassic finished. Overall success: False (timeout) ==="
