@@ -441,7 +441,51 @@ $targets = @(
 # Office already had this kind of real confirmation (it re-checks the
 # registry after running ODT); this brings the Dell targets up to the
 # same standard instead of just trusting that the command ran cleanly.
+function Remove-TaskbarPinByName {
+    # HONESTY FLAG: programmatically unpinning a taskbar item is a
+    # well-known, notoriously unreliable area of Windows automation --
+    # Microsoft doesn't provide a documented API for it, and has
+    # progressively locked down the old community workarounds (a Shell
+    # COM "Unpin from taskbar" verb) across Windows 10/11 versions. This
+    # uses the most commonly-cited, reliable mechanism instead: deleting
+    # the actual pinned shortcut file directly. Scoped to the CURRENTLY
+    # RUNNING account's own profile only -- a brand new user profile
+    # created later on this same machine could still inherit a stale pin
+    # if one was baked into the Default profile template, which this
+    # doesn't attempt to address (a separate, more involved problem than
+    # what was actually asked for here).
+    #
+    # Deliberately does NOT depend on whether the underlying app was
+    # actually removed -- the goal here is specifically "not clickable
+    # from the taskbar," independent of whether full removal succeeded.
+    param([Parameter(Mandatory)][string]$NameSubstring)
+
+    $pinnedDir = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+    if (-not (Test-Path $pinnedDir)) {
+        Write-Log "No taskbar pins folder found for the current profile -- nothing to unpin." 'WARN'
+        return
+    }
+
+    $matches = Get-ChildItem -Path $pinnedDir -Filter '*.lnk' -ErrorAction SilentlyContinue |
+        Where-Object { $_.BaseName -like "*$NameSubstring*" }
+
+    if (-not $matches) {
+        Write-Log "No taskbar pin found matching '$NameSubstring' -- nothing to unpin." 'WARN'
+        return
+    }
+
+    foreach ($match in $matches) {
+        try {
+            Remove-Item -LiteralPath $match.FullName -Force -ErrorAction Stop
+            Write-Log "Removed taskbar pin: $($match.FullName)"
+        } catch {
+            Write-Log "Failed to remove taskbar pin $($match.FullName): $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
 function Test-TargetStillPresent {
+
     param(
         [Parameter(Mandatory)][string[]]$NamePatterns,
         [Parameter(Mandatory)][string[]]$AppxSubstrings
@@ -497,6 +541,15 @@ foreach ($t in $targets) {
         $anyFailed = $true
     } else {
         Write-Log "Confirmed gone."
+    }
+
+    # Requested specifically for Dell Optimizer: even when full removal
+    # doesn't succeed, at minimum make sure it's not sitting pinned to
+    # the taskbar where a user could click and open it. Called
+    # unconditionally, independent of whether the removal above actually
+    # worked -- the goal here is "not clickable," not "confirmed removed".
+    if ($t.DisplayName -eq 'Dell Optimizer') {
+        Remove-TaskbarPinByName -NameSubstring 'Optimizer'
     }
 }
 
