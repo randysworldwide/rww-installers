@@ -448,39 +448,68 @@ function Remove-TaskbarPinByName {
     # progressively locked down the old community workarounds (a Shell
     # COM "Unpin from taskbar" verb) across Windows 10/11 versions. This
     # uses the most commonly-cited, reliable mechanism instead: deleting
-    # the actual pinned shortcut file directly. Scoped to the CURRENTLY
-    # RUNNING account's own profile only -- a brand new user profile
-    # created later on this same machine could still inherit a stale pin
-    # if one was baked into the Default profile template, which this
-    # doesn't attempt to address (a separate, more involved problem than
-    # what was actually asked for here).
+    # the actual pinned shortcut file directly.
+    #
+    # TARGETS THE DEFAULT PROFILE TEMPLATE (C:\Users\Default\...), NOT
+    # just the currently-running account's own profile. This script runs
+    # as the throwaway OOBE account, which gets deleted later -- fixing
+    # only that account's own pins would be pointless, since that profile
+    # won't exist by the time any real user (local admin or domain user)
+    # ever logs into this machine. Every new profile Windows creates
+    # copies its initial state from C:\Users\Default\ the first time that
+    # account logs on, so fixing the template there is what actually
+    # reaches every future profile -- and is also very likely where an
+    # OEM's own pinned bloatware actually lives in the first place, since
+    # that's the standard way vendors make something pre-pinned for every
+    # user on a factory image. Unlike per-user REGISTRY settings (which
+    # would need offline hive loading to edit for a profile that isn't
+    # logged in), taskbar pins are just files, so the Default profile's
+    # copy is directly editable with a normal file operation -- no extra
+    # complexity needed.
+    #
+    # Also still checks the current session's own profile, mainly so the
+    # pin is gone immediately if anyone glances at the taskbar during
+    # deployment itself -- but the Default-profile fix above is the one
+    # that actually matters for the stated goal.
     #
     # Deliberately does NOT depend on whether the underlying app was
     # actually removed -- the goal here is specifically "not clickable
     # from the taskbar," independent of whether full removal succeeded.
     param([Parameter(Mandatory)][string]$NameSubstring)
 
-    $pinnedDir = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
-    if (-not (Test-Path $pinnedDir)) {
-        Write-Log "No taskbar pins folder found for the current profile -- nothing to unpin." 'WARN'
-        return
-    }
+    $pinnedDirs = @(
+        "C:\Users\Default\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar",
+        "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+    )
 
-    $matches = Get-ChildItem -Path $pinnedDir -Filter '*.lnk' -ErrorAction SilentlyContinue |
-        Where-Object { $_.BaseName -like "*$NameSubstring*" }
-
-    if (-not $matches) {
-        Write-Log "No taskbar pin found matching '$NameSubstring' -- nothing to unpin." 'WARN'
-        return
-    }
-
-    foreach ($match in $matches) {
-        try {
-            Remove-Item -LiteralPath $match.FullName -Force -ErrorAction Stop
-            Write-Log "Removed taskbar pin: $($match.FullName)"
-        } catch {
-            Write-Log "Failed to remove taskbar pin $($match.FullName): $($_.Exception.Message)" 'WARN'
+    $anyFound = $false
+    foreach ($pinnedDir in $pinnedDirs) {
+        if (-not (Test-Path $pinnedDir)) {
+            Write-Log "No taskbar pins folder at $pinnedDir -- nothing to unpin there." 'WARN'
+            continue
         }
+
+        $matches = Get-ChildItem -Path $pinnedDir -Filter '*.lnk' -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -like "*$NameSubstring*" }
+
+        if (-not $matches) {
+            Write-Log "No taskbar pin found matching '$NameSubstring' in $pinnedDir." 'WARN'
+            continue
+        }
+
+        foreach ($match in $matches) {
+            try {
+                Remove-Item -LiteralPath $match.FullName -Force -ErrorAction Stop
+                Write-Log "Removed taskbar pin: $($match.FullName)"
+                $anyFound = $true
+            } catch {
+                Write-Log "Failed to remove taskbar pin $($match.FullName): $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    if (-not $anyFound) {
+        Write-Log "No matching taskbar pins were found or removed for '$NameSubstring' in any checked profile." 'WARN'
     }
 }
 
