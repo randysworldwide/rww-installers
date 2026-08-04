@@ -178,7 +178,30 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
         # rather than assuming "no exception" means "complete copy".
         $localSiblingCheck = Join-Path $StageDir $criticalSiblingFile
         if (-not (Test-Path -LiteralPath $localSiblingCheck)) {
-            throw "Staging completed without error, but $criticalSiblingFile is still missing locally afterward."
+            # FALLBACK: confirmed in practice that the share can end up
+            # with this file present but NOT at the nested path the MSI's
+            # own directory table expects -- e.g. if the share gets
+            # re-populated by copying an already-INSTALLED ZAC folder
+            # (C:\Program Files (x86)\Zultys\ZAC, a flat destination
+            # layout) rather than the original administrative-install
+            # source package (which has it nested under
+            # "program files\Zultys\ZAC\"). Rather than require the
+            # share's layout to exactly match what the MSI wants, search
+            # the whole source tree for a file with this exact name and,
+            # if found anywhere, place it at the correct nested path
+            # ourselves.
+            $siblingFileName = Split-Path -Path $criticalSiblingFile -Leaf
+            $fallbackMatch = Get-ChildItem -LiteralPath $sourceDir -Recurse -Filter $siblingFileName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($fallbackMatch) {
+                Write-Log "'$siblingFileName' wasn't at the expected nested path ($criticalSiblingFile), but was found elsewhere on the source ($($fallbackMatch.FullName)) -- copying it into the location the MSI actually expects."
+                $destParent = Split-Path -Path $localSiblingCheck -Parent
+                if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
+                Copy-Item -LiteralPath $fallbackMatch.FullName -Destination $localSiblingCheck -Force -ErrorAction Stop
+            }
+        }
+
+        if (-not (Test-Path -LiteralPath $localSiblingCheck)) {
+            throw "Staging completed without error, but $criticalSiblingFile is still missing locally afterward (also not found anywhere else on the source under a different layout)."
         }
 
         $localMsi = Join-Path $StageDir $MsiFileName
