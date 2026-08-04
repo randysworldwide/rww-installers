@@ -220,6 +220,40 @@ if (-not (Test-IsElevated)) {
     exit 3
 }
 
+# WELL-REASONED HYPOTHESIS, NOT YET FULLY CONFIRMED: real testing showed
+# ConnectWise Agent (an MSI custom action handle leak) and Google Chrome
+# (winget) BOTH failing in the SAME run -- specifically the resumed
+# session right after the Change Computer Name + Join Domain reboot,
+# launched via the "at logon" scheduled task. Two completely unrelated
+# installer technologies failing together in that exact spot rules out
+# "bug in one vendor's package" as the sole explanation. Chrome's own
+# winget exit code (-1978335215) decodes to 0x8A150011,
+# APPINSTALLER_CLI_ERROR_INSTALL_TIME_OUT -- a real, concrete data point
+# consistent with the network/DNS stack not being fully stable yet. A
+# freshly domain-joined machine's DNS servers often change to point at
+# the domain's own DNS the moment the join completes, and that can take
+# a genuine, noticeable amount of time to settle after that specific
+# kind of reboot -- plausibly explaining both the winget timeout AND
+# ConnectWise's own custom action hitting an unhandled exception path
+# (if it does some network-dependent property lookup) that happens to be
+# exactly where their code fails to release its handle. Checked via DNS
+# resolution specifically, not just raw connectivity, since DNS is what
+# tends to lag behind basic IP connectivity in this exact scenario.
+function Wait-ForNetworkReadiness {
+    param([int]$MaxWaitSeconds = 60, [int]$PollSeconds = 5)
+    $elapsed = 0
+    while ($elapsed -lt $MaxWaitSeconds) {
+        try {
+            if (Resolve-DnsName -Name 'www.microsoft.com' -ErrorAction Stop) {
+                return $true
+            }
+        } catch {}
+        Start-Sleep -Seconds $PollSeconds
+        $elapsed += $PollSeconds
+    }
+    return $false
+}
+
 # Minimize (not hide) the console window now that we're handing off to the
 # GUI, so it doesn't sit visible behind the selection/progress windows for
 # the whole run. Minimized rather than hidden on purpose: if something goes
@@ -1316,6 +1350,13 @@ if ($ResumeAfterReboot.IsPresent) {
     }
 
     Write-Log ("Resuming with: " + (($selected | ForEach-Object { $_.Name }) -join ', '))
+
+    Write-Log "Checking network/DNS readiness before proceeding -- a freshly domain-joined machine's DNS can take a moment to fully settle right after this specific reboot."
+    if (Wait-ForNetworkReadiness) {
+        Write-Log "Network/DNS confirmed ready."
+    } else {
+        Write-Log "Network/DNS still not confirmed ready after the wait -- proceeding anyway, but this may explain a network-timing-related failure if one occurs early in this run." 'WARN'
+    }
 } else {
     $selected = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
 
