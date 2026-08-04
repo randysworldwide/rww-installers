@@ -169,9 +169,35 @@ $exeArgs = '/s /v"/qn REBOOT=ReallySuppress /norestart"'
 Write-Log "Running: $localExe $exeArgs (timeout ${InstallTimeoutSeconds}s)"
 
 $proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -PassThru -WindowStyle Hidden
-$completedInTime = $proc.WaitForExit($InstallTimeoutSeconds * 1000)
 
-if (-not $completedInTime) {
+# CONFIRMED IN TESTING: this used to call $proc.WaitForExit(ms) directly
+# -- a blocking .NET call. This is the ONLY script in the whole project
+# that waited this way instead of Start-Process's own -Wait switch
+# (used everywhere else), and it's the one that caused a real, confirmed
+# GUI freeze: the background worker kept executing fine underneath
+# (confirmed via the log -- everything after ZAC kept installing
+# normally), but the main progress window's own display froze solid,
+# only at the point ZAC ran. Root cause: calling raw
+# Process.WaitForExit() from an STA thread (the background runspace is
+# correctly STA, per an earlier fix) is a well-documented source of
+# exactly this symptom if the launched process creates ANY window --
+# even a hidden one, which -WindowStyle Hidden still does -- and that
+# window communicates back to the parent via window messages.
+# WaitForExit() can starve the calling thread's own message pump while
+# blocking, freezing that thread's responsiveness even though the actual
+# wait itself completes normally. ZAC's InstallShield bootstrapper is
+# exactly the kind of GUI-capable process that does this internally even
+# when run silently. Fixed by polling instead of blocking -- Start-Sleep
+# doesn't carry the same message-pump requirement that
+# Process.WaitForExit() does on an STA thread.
+$elapsedSeconds = 0
+$pollIntervalSeconds = 2
+while (-not $proc.HasExited -and $elapsedSeconds -lt $InstallTimeoutSeconds) {
+    Start-Sleep -Seconds $pollIntervalSeconds
+    $elapsedSeconds += $pollIntervalSeconds
+}
+
+if (-not $proc.HasExited) {
     Write-Log "Installer did not finish within ${InstallTimeoutSeconds}s -- likely means the silent switches didn't achieve full silence and a wizard window is waiting for input that will never come. Killing it rather than hanging the whole deployment run." 'ERROR'
     try { $proc.Kill() } catch {}
     Write-Log "=== Install-ZAC finished. Overall success: False ==="
