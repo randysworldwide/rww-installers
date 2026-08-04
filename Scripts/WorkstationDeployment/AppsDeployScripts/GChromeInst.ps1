@@ -1,28 +1,54 @@
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Installs Google Chrome machine-wide via winget.
-    Designed to run elevated on a single box (RWW WorkstationDeployment
-    project -- see Apps-Deploy-Menu.ps1).
+    Installs Google Chrome machine-wide via Google's own official
+    Enterprise MSI, downloaded directly. Designed to run elevated on a
+    single box (RWW WorkstationDeployment project -- see
+    Apps-Deploy-Menu.ps1).
 
 .DESCRIPTION
     Repo: randysworldwide/rww-installers
     Path: Scripts/WorkstationDeployment/AppsDeployScripts/GChromeInst.ps1
 
-    Standard winget machine-wide install. No repo-hosted download needed --
-    winget pulls the installer straight from Google.
+    CHANGED FROM AN EARLIER VERSION, CONFIRMED VIA REAL TESTING: this used
+    to install via winget (Google.Chrome). It failed consistently, every
+    time, with "Installer hash does not match" -- and running elevated,
+    winget has no interactive override for a hash mismatch, so this was a
+    hard, unconditional failure. The actual winget diagnostic log showed
+    the real cause precisely: a completely fresh download (not a stale
+    cache) still didn't match the hash winget's own community-maintained
+    manifest expected for Google.Chrome. That means Google had already
+    updated the actual installer being served, but winget's manifest
+    hadn't caught up yet -- a known, recurring category of issue for
+    "evergreen" auto-updating installers like Chrome, which can happen
+    again any time Chrome updates faster than the community manifest does.
+
+    FIXED by bypassing winget's manifest/hash dependency entirely: this
+    downloads Google's own official Enterprise MSI directly from Google
+    (not a community-maintained package source), and installs it with
+    msiexec directly -- the same officially-documented method Google
+    itself publishes for enterprise deployment.
+
+        https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi
+
+    This URL doesn't involve a separate manifest/hash-verification layer
+    the way winget does -- msiexec just installs whatever Google is
+    currently serving at Google's own official enterprise download
+    endpoint, so there's no equivalent "manifest lagged behind the real
+    file" failure mode possible here.
 
     Idempotent: checks the uninstall registry keys (including loaded user
     hives) before doing anything, so re-running on a machine that already
     has it is a no-op.
 
 .PARAMETER LogPath
-    Where to write the log file. Defaults under ProgramData so it's readable
-    without a user profile loaded.
+    Where to write the log file. Defaults under ProgramData so it's
+    readable without a user profile loaded.
 
 .EXITCODES
     0 = success -- Google Chrome was actually installed this run
     1 = install failed
-    2 = winget could not be resolved on this machine
+    2 = could not download the installer from Google
     3 = not running elevated
     4 = nothing to do -- Google Chrome was already installed (no install action taken)
 #>
@@ -33,6 +59,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+$StageDir       = "$env:ProgramData\Dev\AppsDeploy\GoogleChrome"
+$DownloadUrl    = 'https://dl.google.com/chrome/install/GoogleChromeStandaloneEnterprise64.msi'
+$LocalMsiName   = 'GoogleChromeStandaloneEnterprise64.msi'
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -70,26 +100,7 @@ if (-not (Test-IsElevated)) {
 }
 
 # ---------------------------------------------------------------------------
-# winget resolution (not guaranteed on PATH in every context)
-# ---------------------------------------------------------------------------
-function Resolve-WinGetPath {
-    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-
-    $candidate = Get-ChildItem "$env:ProgramFiles\WindowsApps" `
-        -Filter 'Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe' `
-        -Directory -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending | Select-Object -First 1
-
-    if ($candidate) {
-        $exe = Join-Path $candidate.FullName 'winget.exe'
-        if (Test-Path $exe) { return $exe }
-    }
-    return $null
-}
-
-# ---------------------------------------------------------------------------
-# Detection (registry-based, not winget list -- faster/more reliable)
+# Detection (registry-based, including loaded user hives)
 # ---------------------------------------------------------------------------
 function Test-AppInstalledByRegistry {
     param([Parameter(Mandatory)][string]$NameLike)
@@ -111,44 +122,6 @@ function Test-AppInstalledByRegistry {
 }
 
 # ---------------------------------------------------------------------------
-# Install
-# ---------------------------------------------------------------------------
-function Install-WithWinget {
-    param(
-        [Parameter(Mandatory)][string]$WingetPath,
-        [Parameter(Mandatory)][string]$PackageId,
-        [string[]]$ExtraArgs = @()
-    )
-    $argList = @(
-        'install', '--id', $PackageId, '-e', '--silent', '--source', 'winget',
-        '--accept-package-agreements', '--accept-source-agreements',
-        '--disable-interactivity'
-    ) + $ExtraArgs
-    # Retry on APPINSTALLER_CLI_ERROR_INSTALL_INSTALL_IN_PROGRESS (-1978334974 /
-    # 0x8A150102) -- observed in testing when winget calls run back-to-back
-    # with no gap between them; winget's own installer coordination can
-    # briefly report another install in progress even though nothing else
-    # is actually running. Same retry/backoff shape as the msiexec 1618
-    # handling elsewhere in this project (Cisco Secure Client, ConnectWise
-    # Agent).
-    $maxAttempts = 4
-    $delay = 20
-    $exitCode = -1
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        Write-Log "Running (attempt $attempt/$maxAttempts): winget $($argList -join ' ')"
-        $proc = Start-Process -FilePath $WingetPath -ArgumentList $argList -NoNewWindow -PassThru -Wait
-        $exitCode = $proc.ExitCode
-        if ($exitCode -ne -1978334974) { break }
-        if ($attempt -lt $maxAttempts) {
-            Write-Log "winget reported another install already in progress. Waiting ${delay}s then retrying." 'WARN'
-            Start-Sleep -Seconds $delay
-            $delay = [Math]::Min($delay + 15, 60)
-        }
-    }
-    return $exitCode
-}
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 Write-Log "=== Install-GChrome starting on $env:COMPUTERNAME ==="
@@ -159,21 +132,28 @@ if (Test-AppInstalledByRegistry -NameLike 'Google Chrome') {
     exit 4
 }
 
-$wingetPath = Resolve-WinGetPath
-if (-not $wingetPath) {
-    Write-Log "winget.exe could not be resolved on this machine." 'ERROR'
+try {
+    if (-not (Test-Path $StageDir)) { New-Item -Path $StageDir -ItemType Directory -Force | Out-Null }
+    $localMsi = Join-Path $StageDir $LocalMsiName
+    Write-Log "Downloading $DownloadUrl to $localMsi"
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $localMsi -UseBasicParsing -ErrorAction Stop
+} catch {
+    Write-Log "Failed to download the Chrome Enterprise MSI from Google: $($_.Exception.Message)" 'ERROR'
     exit 2
 }
-Write-Log "Using winget at: $wingetPath"
 
+$msiArgs = "/i `"$localMsi`" /qn /norestart ALLUSERS=1"
+Write-Log "Running: msiexec.exe $msiArgs"
+$proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+$exitCode = $proc.ExitCode
+Write-Log "msiexec exit code: $exitCode"
 
-$code = Install-WithWinget -WingetPath $wingetPath -PackageId 'Google.Chrome' -ExtraArgs @('--scope','machine')
-if ($code -eq 0 -or $code -eq -1978335189 -or (Test-AppInstalledByRegistry -NameLike 'Google Chrome')) {
+if ($exitCode -in @(0, 3010, 1641) -or (Test-AppInstalledByRegistry -NameLike 'Google Chrome')) {
     Write-Log "Google Chrome installed successfully."
     Write-Log "=== Install-GChrome finished. Overall success: True ==="
     exit 0
 } else {
-    Write-Log "Google Chrome install failed (winget exit code $code)." 'ERROR'
+    Write-Log "Google Chrome install failed (msiexec exit code $exitCode)." 'ERROR'
     Write-Log "=== Install-GChrome finished. Overall success: False ==="
     exit 1
 }
