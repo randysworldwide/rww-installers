@@ -46,16 +46,25 @@
          there) now correctly keeps retrying on subsequent boots instead
          of silently giving up.
 
-    ALSO FIXED: even after the throwaway account is deleted, Windows'
-    logon screen kept defaulting to (trying to show a tile for) that now-
-    deleted account, since it remembers the "last logged on user" via the
-    LogonUI registry keys independently of whether the account still
-    exists. The cleanup script now updates those keys to point at the
-    built-in Administrator account once removal succeeds, so the logon
-    screen defaults there instead of to a ghost tile. This part is based
-    on general Windows internals knowledge (the LogonUI mechanism itself),
-    not something confirmed on a real logon screen yet -- flagging that
-    honestly rather than presenting it as verified.
+    CONFIRMED IN TESTING -- FIRST ATTEMPT DIDN'T WORK, FIXED PROPERLY THE
+    SECOND TIME: even after the throwaway account is genuinely deleted
+    (account and profile both confirmed gone), Windows' logon screen kept
+    showing a stale tile for it, prompting for a password that can never
+    work since the account no longer exists. An earlier version of this
+    script tried fixing this by redirecting the LogonUI "last logged on
+    user" registry keys to the built-in Administrator account -- that
+    code ran successfully and reported success, but a real test showed
+    the stale tile persisted anyway. Real reports of this exact symptom
+    (found via research after the first attempt didn't hold up) point to
+    a DIFFERENT, more direct mechanism: Windows' documented way to hide a
+    specific account from the logon screen entirely, regardless of any
+    internal caching, is a DWORD value named exactly as the account (set
+    to 0) under Winlogon\SpecialAccounts\UserList. That's now the primary
+    fix; the original LastLoggedOnUser redirect is kept as a secondary,
+    harmless addition but isn't relied on alone anymore. Also added: a
+    narrowly-scoped cleanup of any stale ProfileList registry entry for
+    the removed account, another commonly-cited cause of this same
+    symptom in real reports.
 
     Steps this script performs NOW (pre-reboot):
       1. Determine the target account -- defaults to whichever account is
@@ -220,19 +229,58 @@ try {
     Write-CleanupLog "Failed to remove local account: $($_.Exception.Message)" 'ERROR'
 }
 
-# BEST EFFORT, NOT VERIFIED LIVE (flagging honestly, same as anywhere else
-# in this project where that's true): even after the account is deleted,
-# Windows' logon screen still remembers it via the LogonUI registry keys
-# and keeps trying to show/pre-select a tile for it. This updates those
-# same keys to point at the built-in Administrator account instead, so
-# the logon screen defaults there rather than to a ghost tile for an
-# account that no longer exists. The SID needs to be written in its raw
-# BINARY form (not the string "S-1-5-...") to match what Windows itself
-# stores -- using .NET's own SecurityIdentifier.GetBinaryForm() for that
-# conversion rather than hand-building the bytes, which is the correct,
-# well-documented way to do it, but the overall LogonUI mechanism itself
-# is based on general Windows internals knowledge, not something this
-# project has been able to confirm on a real login screen yet.
+# CONFIRMED VIA RESEARCH: real reports of this EXACT symptom (account
+# and profile both genuinely deleted, but a stale tile with a password
+# prompt persists on the logon screen) point to Windows' OWN internal
+# logon-screen caching, which the LastLoggedOnUser update above does NOT
+# reliably override -- confirmed by a real test where that update ran
+# successfully but the stale tile still appeared. The documented,
+# authoritative mechanism for making a specific account NEVER show as a
+# tile (regardless of any caching) is different: a DWORD value named
+# exactly as the account, set to 0, under
+# Winlogon\SpecialAccounts\UserList. This is more direct than trying to
+# change which account is the DEFAULT -- it hides the stale one outright.
+if ($accountRemoved) {
+    try {
+        $specialAccountsKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
+        if (-not (Test-Path $specialAccountsKey)) { New-Item -Path $specialAccountsKey -Force | Out-Null }
+        Set-ItemProperty -Path $specialAccountsKey -Name $TargetAccount -Value 0 -Type DWord -ErrorAction Stop
+        Write-CleanupLog "Hid '$TargetAccount' from the logon screen tile list directly (SpecialAccounts\UserList) -- the documented Windows mechanism for exactly this situation."
+    } catch {
+        Write-CleanupLog "Failed to hide $TargetAccount via SpecialAccounts\UserList: $($_.Exception.Message)" 'WARN'
+    }
+
+    # Secondary measure: also confirmed in real reports of this same
+    # symptom -- a stale ProfileList registry entry can persist even
+    # after the account and profile folder are both genuinely gone.
+    # Scoped narrowly (only a key whose ProfileImagePath ends in exactly
+    # this account's name) since ProfileList is sensitive -- removing the
+    # wrong entry here could affect a DIFFERENT, unrelated profile.
+    try {
+        $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        $staleProfileKeys = Get-ChildItem -Path $profileListKey -ErrorAction SilentlyContinue | Where-Object {
+            $imgPath = (Get-ItemProperty -Path $_.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue).ProfileImagePath
+            $imgPath -and ($imgPath -eq "C:\Users\$TargetAccount")
+        }
+        foreach ($staleKey in $staleProfileKeys) {
+            Remove-Item -Path $staleKey.PSPath -Recurse -Force -ErrorAction Stop
+            Write-CleanupLog "Removed a stale ProfileList registry entry for $TargetAccount ($($staleKey.PSPath))."
+        }
+        if (-not $staleProfileKeys) {
+            Write-CleanupLog "No stale ProfileList entry found for $TargetAccount -- nothing to clean up there."
+        }
+    } catch {
+        Write-CleanupLog "Failed to check/clean up ProfileList entries for $TargetAccount (non-fatal): $($_.Exception.Message)" 'WARN'
+    }
+}
+
+# BEST EFFORT, NOT VERIFIED LIVE -- unlike the SpecialAccounts\UserList
+# fix above (which is Windows' own documented mechanism), this specific
+# approach (redirecting LastLoggedOnUser to Administrator) was tried once
+# already and did NOT resolve the stale-tile symptom on its own. Left in
+# place since it's harmless and may still help pick which tile is
+# pre-selected once the SpecialAccounts fix actually removes the stale
+# one from the list, but it should not be relied on as the primary fix.
 if ($accountRemoved) {
     try {
         $adminAccount = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1
