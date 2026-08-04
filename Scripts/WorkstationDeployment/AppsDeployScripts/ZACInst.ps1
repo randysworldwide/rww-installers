@@ -187,25 +187,37 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
             }
         }
 
-        # CONFIRMED PATTERN across five separate real msiexec 1308 errors,
-        # each found one at a time: register_x64.vbs, check_vc_x64.vbs,
-        # PlantronicsDevices.xml, qt.conf, and zac.ico were ALL sitting
-        # flat at the TOP LEVEL of the source folder, and ALL needed at
-        # the SAME nested "program files\Zultys\ZAC\" destination path.
-        # An earlier attempt at querying ZAC.msi's own internal database
-        # to find this list automatically and authoritatively did not
-        # pan out after two separate tries at the COM/SQL details -- that
-        # approach is set aside for now in favor of this simpler, more
-        # reliable fix grounded directly in the observed pattern: mirror
-        # EVERY flat, top-level file from the source into the nested
-        # destination too, rather than maintaining a per-file list that
-        # needs a new round-trip every time the MSI turns out to need one
-        # more sibling file than the last test found.
+        # CONFIRMED PATTERN across six separate real msiexec 1308/1309
+        # errors, each found one at a time: register_x64.vbs,
+        # check_vc_x64.vbs, PlantronicsDevices.xml, qt.conf, and zac.ico
+        # were all flat top-level files, but the SIXTH
+        # (translations\qtwebengine_locales\en-GB.pak, almost certainly
+        # one of many QtWebEngine locale .pak files) revealed the pattern
+        # is actually broader: the user's share layout was populated by
+        # copying an already-INSTALLED ZAC folder's contents directly
+        # (so "translations\qtwebengine_locales\..." sits at the TOP of
+        # the source tree), but the MSI's own directory table expects
+        # EVERYTHING -- files AND subfolders, at any depth -- to ALSO
+        # exist nested one level deeper, under
+        # "program files\Zultys\ZAC\". A top-level-only mirror (an
+        # earlier version of this fix) covered the first five files but
+        # missed this one, since it's nested two levels deep, not flat.
+        # Fixed by mirroring the ENTIRE source tree recursively into the
+        # nested destination, not just its top level -- this covers any
+        # file at any depth the MSI might expect there, without needing
+        # to know in advance which ones matter or maintain a per-file
+        # list that needs another round-trip every time the MSI turns
+        # out to need one more file than the last test found.
         $nestedDestDir = Join-Path $StageDir $nestedSiblingDir
         if (-not (Test-Path $nestedDestDir)) { New-Item -Path $nestedDestDir -ItemType Directory -Force | Out-Null }
-        Get-ChildItem -LiteralPath $sourceDir -File -ErrorAction Stop | ForEach-Object {
-            $nestedDest = Join-Path $nestedDestDir $_.Name
-            if (-not (Test-Path -LiteralPath $nestedDest)) {
+        Get-ChildItem -LiteralPath $sourceDir -Recurse -ErrorAction Stop | ForEach-Object {
+            $relativeToSource = $_.FullName.Substring($sourceDir.Length).TrimStart('\')
+            $nestedDest = Join-Path $nestedDestDir $relativeToSource
+            if ($_.PSIsContainer) {
+                if (-not (Test-Path $nestedDest)) { New-Item -Path $nestedDest -ItemType Directory -Force | Out-Null }
+            } elseif (-not (Test-Path -LiteralPath $nestedDest)) {
+                $nestedDestParent = Split-Path -Path $nestedDest -Parent
+                if (-not (Test-Path $nestedDestParent)) { New-Item -Path $nestedDestParent -ItemType Directory -Force | Out-Null }
                 Copy-Item -LiteralPath $_.FullName -Destination $nestedDest -Force -ErrorAction Stop
             }
         }
