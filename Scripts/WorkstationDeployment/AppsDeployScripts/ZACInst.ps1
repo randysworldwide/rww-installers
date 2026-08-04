@@ -102,22 +102,46 @@ function Get-MsiUncompressedFileRelativePaths {
     # bit 0x2000 in the File table's Attributes column) -- exactly the
     # category of file that gets left as a loose, uncompressed file
     # alongside the MSI rather than packed into its compressed cabinet.
-    # register_x64.vbs, check_vc_x64.vbs, and PlantronicsDevices.xml were
-    # ALL discovered this same way, one at a time, through three separate
-    # real msiexec 1308 errors across three separate test cycles -- this
-    # exists so a fourth such file doesn't need the same slow discovery
-    # cycle, by asking the MSI directly for the complete, authoritative
-    # list instead of relying on a manually-maintained one.
+    # register_x64.vbs, check_vc_x64.vbs, PlantronicsDevices.xml, and
+    # qt.conf were ALL discovered this same way, one at a time, through
+    # four separate real msiexec 1308 errors across four separate test
+    # cycles -- this exists so a fifth such file doesn't need the same
+    # slow discovery cycle, by asking the MSI directly for the complete,
+    # authoritative list instead of relying on a manually-maintained one.
     #
-    # UNVERIFIED IN LIVE TESTING: this uses the Windows Installer COM
-    # automation API (WindowsInstaller.Installer), which can't be
-    # exercised from this development environment the way plain
-    # PowerShell logic can -- flagging that honestly. Wrapped so ANY
-    # failure here (a COM interop detail, a DefaultDir parsing edge case,
-    # etc.) falls back silently to the known $criticalSiblingFiles list
-    # in Main rather than breaking the install over an enhancement that
-    # was meant to help.
+    # CONFIRMED BUG, NOW FIXED: an earlier version called
+    # $record.StringData(1) / $record.IntegerData(2) directly. StringData
+    # and IntegerData on the Windows Installer Record COM object are
+    # INDEXED PROPERTIES, not plain methods -- PowerShell's default
+    # late-bound COM call syntax silently returns nothing for this
+    # specific kind of indexed-property access instead of throwing an
+    # error, which is a worse failure mode than an exception (it looked
+    # like it worked -- "found 2 files" -- while actually returning two
+    # empty strings). Confirmed via a real test run showing exactly that.
+    # Fixed by using explicit reflection (GetType().InvokeMember(...,
+    # 'GetProperty', ...)) for every Record property access instead of
+    # the direct $record.Property(index) syntax, which is the
+    # well-documented, reliable way to call indexed COM properties from
+    # PowerShell.
+    #
+    # STILL FLAGGING HONESTLY: this is now believed correct based on
+    # understanding the specific bug that caused the empty-string result,
+    # but hasn't yet been confirmed against a real successful run showing
+    # actual non-empty file paths. Still wrapped so ANY failure here
+    # falls back silently to the known $criticalSiblingFiles list in
+    # Main, and empty/blank results are now explicitly filtered out
+    # rather than passed through, so even a repeat of this exact failure
+    # mode can no longer inject garbage entries into the check list.
     param([string]$MsiPath)
+
+    function Invoke-ComMethod {
+        param($ComObject, [string]$MethodName, [object[]]$MethodArgs = @())
+        return $ComObject.GetType().InvokeMember($MethodName, [System.Reflection.BindingFlags]::InvokeMethod, $null, $ComObject, $MethodArgs)
+    }
+    function Get-ComProperty {
+        param($ComObject, [string]$PropertyName, [object[]]$PropertyArgs = @())
+        return $ComObject.GetType().InvokeMember($PropertyName, [System.Reflection.BindingFlags]::GetProperty, $null, $ComObject, $PropertyArgs)
+    }
 
     $NoncompressedBit = 0x2000
     $installer = $null
@@ -125,16 +149,18 @@ function Get-MsiUncompressedFileRelativePaths {
 
     try {
         $installer = New-Object -ComObject WindowsInstaller.Installer
-        $db = $installer.OpenDatabase($MsiPath, 0)
+        $db = Invoke-ComMethod $installer 'OpenDatabase' @($MsiPath, 0)
 
         # Directory table lookup: DirectoryId -> @{ Parent; Name }
         $dirLookup = @{}
-        $dirView = $db.OpenView("SELECT Directory, Directory_Parent, DefaultDir FROM Directory")
-        $dirView.Execute()
-        while ($rec = $dirView.Fetch()) {
-            $dirId      = $rec.StringData(1)
-            $parentId   = $rec.StringData(2)
-            $defaultDir = $rec.StringData(3)
+        $dirView = Invoke-ComMethod $db 'OpenView' @('SELECT Directory, Directory_Parent, DefaultDir FROM Directory')
+        Invoke-ComMethod $dirView 'Execute' @() | Out-Null
+        while ($true) {
+            $rec = Invoke-ComMethod $dirView 'Fetch' @()
+            if (-not $rec) { break }
+            $dirId      = Get-ComProperty $rec 'StringData' @(1)
+            $parentId   = Get-ComProperty $rec 'StringData' @(2)
+            $defaultDir = Get-ComProperty $rec 'StringData' @(3)
             # DefaultDir is "8.3SHORT|LongName", or just one name with no pipe.
             $longName = $defaultDir
             if ($defaultDir -and $defaultDir.Contains('|')) {
@@ -163,18 +189,22 @@ function Get-MsiUncompressedFileRelativePaths {
         }
 
         $results = @()
-        $fileView = $db.OpenView("SELECT File.FileName, File.Attributes, Component.Directory_ FROM File, Component WHERE File.Component_ = Component.Component")
-        $fileView.Execute()
-        while ($rec = $fileView.Fetch()) {
-            $fileNameRaw = $rec.StringData(1)
-            $attributes  = $rec.IntegerData(2)
-            $dirId       = $rec.StringData(3)
+        $fileView = Invoke-ComMethod $db 'OpenView' @('SELECT File.FileName, File.Attributes, Component.Directory_ FROM File, Component WHERE File.Component_ = Component.Component')
+        Invoke-ComMethod $fileView 'Execute' @() | Out-Null
+        while ($true) {
+            $rec = Invoke-ComMethod $fileView 'Fetch' @()
+            if (-not $rec) { break }
+            $fileNameRaw = Get-ComProperty $rec 'StringData' @(1)
+            $attributes  = Get-ComProperty $rec 'IntegerData' @(2)
+            $dirId       = Get-ComProperty $rec 'StringData' @(3)
 
-            if (($attributes -band $NoncompressedBit) -ne 0) {
+            if ($attributes -and (([int]$attributes -band $NoncompressedBit) -ne 0)) {
                 $longFileName = $fileNameRaw
                 if ($fileNameRaw -and $fileNameRaw.Contains('|')) {
                     $longFileName = $fileNameRaw.Split('|')[1]
                 }
+                if ([string]::IsNullOrWhiteSpace($longFileName)) { continue }
+
                 $dirRelative = Resolve-MsiDirRelativePath -DirId $dirId -Lookup $dirLookup
                 if ($dirRelative) {
                     $results += Join-Path $dirRelative $longFileName
@@ -184,7 +214,12 @@ function Get-MsiUncompressedFileRelativePaths {
             }
         }
 
-        return $results
+        # Defensive filter: never pass through a blank/whitespace entry,
+        # even if some other parsing edge case slips one through above --
+        # an empty string in this list would resolve to $StageDir itself
+        # in the caller's Join-Path, which is harmless but useless, and
+        # was exactly the confirmed symptom of the bug this fixes.
+        return @($results | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     } catch {
         Write-Log "Dynamic MSI uncompressed-file query failed (this is a best-effort enhancement -- falling back to the known baseline list): $($_.Exception.Message)" 'WARN'
         return @()
@@ -236,7 +271,8 @@ if (-not $sourceDir) {
 $criticalSiblingFiles = @(
     'program files\Zultys\ZAC\register_x64.vbs',
     'program files\Zultys\ZAC\check_vc_x64.vbs',
-    'program files\Zultys\ZAC\PlantronicsDevices.xml'
+    'program files\Zultys\ZAC\PlantronicsDevices.xml',
+    'program files\Zultys\ZAC\qt.conf'
 )
 
 Write-Log "Querying ZAC.msi's own internal database for the complete, authoritative list of uncompressed sibling files (in addition to the three already known from previous testing)."
