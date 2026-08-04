@@ -239,6 +239,25 @@ function Wait-ForCWAgentRegistration {
 # ---------------------------------------------------------------------------
 # Install (used for both the initial attempt and the repair retry)
 # ---------------------------------------------------------------------------
+function Test-Msi2769HandleLeak {
+    # CONFIRMED IN TESTING: ConnectWise's own "SetPropertyValues" custom
+    # action sometimes fails with MSI error 2769 ("Custom Action X did
+    # not close N MSIHANDLEs") -- a well-documented, generic class of
+    # Windows Installer bug where a custom action leaks a handle it
+    # opened. This is a bug in ConnectWise's own compiled custom action
+    # code, not anything caused by this script, staging, or the TLS fix.
+    # It can be timing-sensitive/intermittent, so retrying is worth
+    # attempting -- but only specifically for THIS signature, checked
+    # directly in the verbose log, not for every generic 1603 (which can
+    # have many other, non-retriable causes).
+    if (-not (Test-Path -LiteralPath $MsiLogPath -ErrorAction SilentlyContinue)) { return $false }
+    try {
+        return [bool](Select-String -Path $MsiLogPath -Pattern 'Error 2769' -Quiet -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
 function Install-CWAgentOnce {
     param([string]$LocalMsi, [string]$LocalMst, [string]$AttemptLabel)
 
@@ -254,6 +273,11 @@ function Install-CWAgentOnce {
             Write-Log "[$AttemptLabel] Installer busy (1618). Waiting ${delay}s then retrying." 'WARN'
             Start-Sleep -Seconds $delay
             $delay = [Math]::Min($delay + 15, 60)
+            continue
+        }
+        if ($finalCode -eq 1603 -and $attempt -lt $maxAttempts -and (Test-Msi2769HandleLeak)) {
+            Write-Log "[$AttemptLabel] Detected MSI error 2769 (ConnectWise's own SetPropertyValues custom action leaked a handle -- a known class of bug in their package, not this script). Retrying in case it's timing-sensitive." 'WARN'
+            Start-Sleep -Seconds 10
             continue
         }
         break
@@ -276,6 +300,68 @@ function Uninstall-CWAgentForRepair {
         Stop-Service -Name 'LTService' -Force -ErrorAction SilentlyContinue
         Start-Process -FilePath 'sc.exe' -ArgumentList 'delete LTService' -Wait -NoNewWindow -ErrorAction SilentlyContinue | Out-Null
     } catch {}
+}
+
+function Get-CWAgentSignupDiagnosis {
+    # CONFIRMED IN TESTING (a real "ghost agent" case, resolved by
+    # regenerating Agent_Install.msi/.mst from the Automate web app): the
+    # agent's own log (C:\Windows\LTSvc\LTErrors.txt) shows a reliably
+    # DIFFERENT signature depending on WHY sign-up failed:
+    #   - A TLS/network problem logs an explicit "SecureChannelFailure"
+    #     line with detail.
+    #   - The Automate SERVER rejecting the sign-up (e.g. a stale/invalid
+    #     LocationID or token in Agent_Install.mst, or a stale/conflicting
+    #     device record already on the server for this machine) logs just
+    #     "Failed Signup, Will wait over 30 minutes to try again." with NO
+    #     error detail at all -- the absence of a specific error is itself
+    #     the signal, since a local/network failure DOES get logged with
+    #     detail.
+    # This distinction matters because a local uninstall+reinstall cycle
+    # can only ever fix a local problem -- it cannot fix a server-side
+    # rejection, since retrying with the exact same (bad) file just fails
+    # the exact same way again.
+    param([datetime]$Since)
+
+    $errorsPath = 'C:\Windows\LTSvc\LTErrors.txt'
+    if (-not (Test-Path -LiteralPath $errorsPath -ErrorAction SilentlyContinue)) {
+        return 'NoLogFound'
+    }
+
+    try {
+        $lines = Get-Content -LiteralPath $errorsPath -ErrorAction Stop
+    } catch {
+        return 'NoLogFound'
+    }
+
+    $recentLines = @()
+    foreach ($line in $lines) {
+        # Lines look like: "LTService  v250.125	 - 8/3/2026 5:05:53 PM	 - ..."
+        if ($line -match '-\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*[AP]M)\s*-') {
+            try {
+                $ts = [datetime]::Parse($Matches[1])
+                if ($ts -ge $Since) { $recentLines += $line }
+            } catch {
+                # Couldn't parse this line's timestamp -- keep it anyway
+                # rather than risk silently missing a real signal over a
+                # parsing quirk.
+                $recentLines += $line
+            }
+        }
+    }
+
+    if ($recentLines.Count -eq 0) {
+        # Couldn't isolate recent lines for some reason -- fall back to
+        # the whole file rather than miss the signal entirely.
+        $recentLines = $lines
+    }
+
+    if ($recentLines -match 'SecureChannelFailure') {
+        return 'TlsFailure'
+    } elseif ($recentLines -match 'Failed Signup') {
+        return 'SignupRejected'
+    } else {
+        return 'Inconclusive'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -335,6 +421,7 @@ if ($serviceExists -and -not $fullyRegistered) {
 }
 
 # --- Initial (or post-repair-cleanup) install attempt ---
+$installStartTime = Get-Date
 $finalCode = Install-CWAgentOnce -LocalMsi $localMsi -LocalMst $localMst -AttemptLabel 'primary'
 
 if ($finalCode -eq 3010 -or $finalCode -eq 1641) {
@@ -360,9 +447,24 @@ if (Wait-ForCWAgentRegistration) {
     exit 0
 }
 
-Write-Log "Still not fully registered after waiting -- this matches the known 'ghost agent' issue. Attempting an automatic repair: uninstall, then reinstall fresh (the same fix this has needed manually before)." 'WARN'
+$diagnosis = Get-CWAgentSignupDiagnosis -Since $installStartTime
+Write-Log "Still not fully registered after waiting. Checked C:\Windows\LTSvc\LTErrors.txt for a specific cause: $diagnosis"
+
+if ($diagnosis -eq 'SignupRejected') {
+    Write-Log "This matches a sign-up REJECTED BY THE SERVER, not a local install problem -- re-running the install won't help, so skipping the automatic repair cycle." 'ERROR'
+    Write-Log "Known fix: regenerate Agent_Install.msi/.mst from the Automate web app and replace the files on the share, and/or check the Automate console for a stale/conflicting device record for this machine and retire it." 'ERROR'
+    Write-Log "=== Install-CWAgent finished. Overall success: False (server-side signup rejection, not a local issue) ==="
+    exit 1
+} elseif ($diagnosis -eq 'TlsFailure') {
+    Write-Log "A SecureChannelFailure was found even after the strong-TLS fix was applied -- unexpected. Proceeding with the automatic repair cycle anyway in case it's transient, but this may need further investigation if it recurs." 'WARN'
+} else {
+    Write-Log "No specific cause identified in LTErrors.txt ($diagnosis) -- proceeding with the automatic repair cycle in case this is a transient/local issue." 'WARN'
+}
+
+Write-Log "Attempting an automatic repair: uninstall, then reinstall fresh." 'WARN'
 Uninstall-CWAgentForRepair -LocalMsi $localMsi
 
+$repairStartTime = Get-Date
 $repairCode = Install-CWAgentOnce -LocalMsi $localMsi -LocalMst $localMst -AttemptLabel 'repair-retry'
 
 if ($repairCode -notin @(0, 1641, 3010)) {
@@ -383,7 +485,13 @@ if (Wait-ForCWAgentRegistration) {
     Write-Log "=== Install-CWAgent finished. Overall success: True (required an automatic repair cycle -- see warnings above) ==="
     exit 0
 } else {
-    Write-Log "Still not fully registered even after the automatic repair cycle. This may need the same manual fix as before, or a check of the Automate console for a stale/conflicting device record for this machine." 'ERROR'
+    $finalDiagnosis = Get-CWAgentSignupDiagnosis -Since $repairStartTime
+    Write-Log "Still not fully registered even after the automatic repair cycle. LTErrors.txt diagnosis: $finalDiagnosis" 'ERROR'
+    if ($finalDiagnosis -eq 'SignupRejected') {
+        Write-Log "This confirms a SERVER-SIDE signup rejection -- regenerate Agent_Install.msi/.mst from the Automate web app and/or check the Automate console for a stale/conflicting device record for this machine." 'ERROR'
+    } else {
+        Write-Log "This may need the same manual fix as before, or a check of the Automate console for a stale/conflicting device record for this machine." 'ERROR'
+    }
     Write-Log "=== Install-CWAgent finished. Overall success: False ==="
     exit 1
 }
