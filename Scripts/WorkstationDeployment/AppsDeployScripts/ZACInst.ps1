@@ -96,140 +96,6 @@ if (-not (Test-IsElevated)) {
     exit 3
 }
 
-function Get-MsiUncompressedFileRelativePaths {
-    # Queries the MSI's own internal Windows Installer database for files
-    # explicitly marked "noncompressed" (msidbFileAttributesNoncompressed,
-    # bit 0x2000 in the File table's Attributes column) -- exactly the
-    # category of file that gets left as a loose, uncompressed file
-    # alongside the MSI rather than packed into its compressed cabinet.
-    # register_x64.vbs, check_vc_x64.vbs, PlantronicsDevices.xml, and
-    # qt.conf were ALL discovered this same way, one at a time, through
-    # four separate real msiexec 1308 errors across four separate test
-    # cycles -- this exists so a fifth such file doesn't need the same
-    # slow discovery cycle, by asking the MSI directly for the complete,
-    # authoritative list instead of relying on a manually-maintained one.
-    #
-    # CONFIRMED BUG, NOW FIXED: an earlier version called
-    # $record.StringData(1) / $record.IntegerData(2) directly. StringData
-    # and IntegerData on the Windows Installer Record COM object are
-    # INDEXED PROPERTIES, not plain methods -- PowerShell's default
-    # late-bound COM call syntax silently returns nothing for this
-    # specific kind of indexed-property access instead of throwing an
-    # error, which is a worse failure mode than an exception (it looked
-    # like it worked -- "found 2 files" -- while actually returning two
-    # empty strings). Confirmed via a real test run showing exactly that.
-    # Fixed by using explicit reflection (GetType().InvokeMember(...,
-    # 'GetProperty', ...)) for every Record property access instead of
-    # the direct $record.Property(index) syntax, which is the
-    # well-documented, reliable way to call indexed COM properties from
-    # PowerShell.
-    #
-    # STILL FLAGGING HONESTLY: this is now believed correct based on
-    # understanding the specific bug that caused the empty-string result,
-    # but hasn't yet been confirmed against a real successful run showing
-    # actual non-empty file paths. Still wrapped so ANY failure here
-    # falls back silently to the known $criticalSiblingFiles list in
-    # Main, and empty/blank results are now explicitly filtered out
-    # rather than passed through, so even a repeat of this exact failure
-    # mode can no longer inject garbage entries into the check list.
-    param([string]$MsiPath)
-
-    function Invoke-ComMethod {
-        param($ComObject, [string]$MethodName, [object[]]$MethodArgs = @())
-        return $ComObject.GetType().InvokeMember($MethodName, [System.Reflection.BindingFlags]::InvokeMethod, $null, $ComObject, $MethodArgs)
-    }
-    function Get-ComProperty {
-        param($ComObject, [string]$PropertyName, [object[]]$PropertyArgs = @())
-        return $ComObject.GetType().InvokeMember($PropertyName, [System.Reflection.BindingFlags]::GetProperty, $null, $ComObject, $PropertyArgs)
-    }
-
-    $NoncompressedBit = 0x2000
-    $installer = $null
-    $db = $null
-
-    try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        $db = Invoke-ComMethod $installer 'OpenDatabase' @($MsiPath, 0)
-
-        # Directory table lookup: DirectoryId -> @{ Parent; Name }
-        $dirLookup = @{}
-        $dirView = Invoke-ComMethod $db 'OpenView' @('SELECT Directory, Directory_Parent, DefaultDir FROM Directory')
-        Invoke-ComMethod $dirView 'Execute' @() | Out-Null
-        while ($true) {
-            $rec = Invoke-ComMethod $dirView 'Fetch' @()
-            if (-not $rec) { break }
-            $dirId      = Get-ComProperty $rec 'StringData' @(1)
-            $parentId   = Get-ComProperty $rec 'StringData' @(2)
-            $defaultDir = Get-ComProperty $rec 'StringData' @(3)
-            # DefaultDir is "8.3SHORT|LongName", or just one name with no pipe.
-            $longName = $defaultDir
-            if ($defaultDir -and $defaultDir.Contains('|')) {
-                $longName = $defaultDir.Split('|')[1]
-            }
-            $dirLookup[$dirId] = @{ Parent = $parentId; Name = $longName }
-        }
-
-        function Resolve-MsiDirRelativePath {
-            param([string]$DirId, [hashtable]$Lookup)
-            $parts = @()
-            $current = $DirId
-            $seen = @{}
-            while ($current -and $Lookup.ContainsKey($current) -and -not $seen.ContainsKey($current)) {
-                $seen[$current] = $true
-                $entry = $Lookup[$current]
-                # '.' means "same folder as parent" -- no path segment of
-                # its own. Root markers contribute nothing either, since
-                # they represent the root itself, not a real subfolder.
-                if ($entry.Name -and $entry.Name -ne '.' -and $entry.Name -notin @('TARGETDIR', 'SourceDir')) {
-                    $parts = @($entry.Name) + $parts
-                }
-                $current = $entry.Parent
-            }
-            return ($parts -join '\')
-        }
-
-        $results = @()
-        $fileView = Invoke-ComMethod $db 'OpenView' @('SELECT File.FileName, File.Attributes, Component.Directory_ FROM File, Component WHERE File.Component_ = Component.Component')
-        Invoke-ComMethod $fileView 'Execute' @() | Out-Null
-        while ($true) {
-            $rec = Invoke-ComMethod $fileView 'Fetch' @()
-            if (-not $rec) { break }
-            $fileNameRaw = Get-ComProperty $rec 'StringData' @(1)
-            $attributes  = Get-ComProperty $rec 'IntegerData' @(2)
-            $dirId       = Get-ComProperty $rec 'StringData' @(3)
-
-            if ($attributes -and (([int]$attributes -band $NoncompressedBit) -ne 0)) {
-                $longFileName = $fileNameRaw
-                if ($fileNameRaw -and $fileNameRaw.Contains('|')) {
-                    $longFileName = $fileNameRaw.Split('|')[1]
-                }
-                if ([string]::IsNullOrWhiteSpace($longFileName)) { continue }
-
-                $dirRelative = Resolve-MsiDirRelativePath -DirId $dirId -Lookup $dirLookup
-                if ($dirRelative) {
-                    $results += Join-Path $dirRelative $longFileName
-                } else {
-                    $results += $longFileName
-                }
-            }
-        }
-
-        # Defensive filter: never pass through a blank/whitespace entry,
-        # even if some other parsing edge case slips one through above --
-        # an empty string in this list would resolve to $StageDir itself
-        # in the caller's Join-Path, which is harmless but useless, and
-        # was exactly the confirmed symptom of the bug this fixes.
-        return @($results | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    } catch {
-        Write-Log "Dynamic MSI uncompressed-file query failed (this is a best-effort enhancement -- falling back to the known baseline list): $($_.Exception.Message)" 'WARN'
-        return @()
-    } finally {
-        # Explicit COM cleanup -- these can hold a file lock on the MSI
-        # otherwise, rather than waiting on .NET garbage collection.
-        if ($db) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($db) }
-        if ($installer) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
-    }
-}
 
 function Test-ZACInstalled {
     $hives = @(
@@ -272,22 +138,10 @@ $criticalSiblingFiles = @(
     'program files\Zultys\ZAC\register_x64.vbs',
     'program files\Zultys\ZAC\check_vc_x64.vbs',
     'program files\Zultys\ZAC\PlantronicsDevices.xml',
-    'program files\Zultys\ZAC\qt.conf'
+    'program files\Zultys\ZAC\qt.conf',
+    'program files\Zultys\ZAC\zac.ico'
 )
-
-Write-Log "Querying ZAC.msi's own internal database for the complete, authoritative list of uncompressed sibling files (in addition to the three already known from previous testing)."
-$dynamicSiblingFiles = Get-MsiUncompressedFileRelativePaths -MsiPath (Join-Path $sourceDir $MsiFileName)
-if ($dynamicSiblingFiles.Count -gt 0) {
-    Write-Log "MSI database query found $($dynamicSiblingFiles.Count) uncompressed file(s): $($dynamicSiblingFiles -join ', ')"
-    foreach ($df in $dynamicSiblingFiles) {
-        if ($criticalSiblingFiles -notcontains $df) {
-            Write-Log "Adding newly-discovered uncompressed file to the check list: $df"
-            $criticalSiblingFiles += $df
-        }
-    }
-} else {
-    Write-Log "Dynamic MSI query found nothing (or the query itself failed -- see any warning above) -- proceeding with the known baseline list only: $($criticalSiblingFiles -join ', ')" 'WARN'
-}
+$nestedSiblingDir = 'program files\Zultys\ZAC'
 
 $stagingAttempts = 3
 $stagedOk = $false
@@ -298,14 +152,18 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
         New-Item -Path $StageDir -ItemType Directory -Force | Out-Null
 
         # ZAC.msi is a "compressed MSI" that also relies on files stored
-        # UNCOMPRESSED alongside it (confirmed to be at least TWO such
-        # files -- register_x64.vbs AND check_vc_x64.vbs, both under a
-        # "program files\Zultys\ZAC\" subfolder relative to the MSI's own
-        # location -- there may be others neither of these two rounds of
-        # testing happened to exercise) -- copying only ZAC.msi itself
-        # fails with a 1308/1309/1603 error because those sibling files
-        # are missing. Stage the whole source folder as a unit instead,
-        # same reasoning as AcroProInst.ps1.
+        # UNCOMPRESSED alongside it -- confirmed to be AT LEAST five such
+        # files (register_x64.vbs, check_vc_x64.vbs,
+        # PlantronicsDevices.xml, qt.conf, zac.ico), each discovered one
+        # at a time through five separate real msiexec 1308 errors across
+        # five separate test cycles, all needed at the same nested
+        # "program files\Zultys\ZAC\" destination path. Copying only
+        # ZAC.msi itself fails with a 1308/1309/1603 error because these
+        # sibling files are missing. Stage the whole source folder as a
+        # unit instead, same reasoning as AcroProInst.ps1 -- and see the
+        # proactive top-level mirror step below the copy loop, which
+        # exists specifically so a SIXTH such file doesn't need the same
+        # slow one-at-a-time discovery cycle.
         Write-Log "Staging entire ZAC source folder to $StageDir (attempt $stageAttempt/$stagingAttempts) -- ZAC.msi relies on sibling uncompressed files, not just the bare MSI"
 
         # -ErrorAction Stop on BOTH calls below is deliberate: confirmed in
@@ -326,6 +184,29 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
                 $destParent = Split-Path -Path $destPath -Parent
                 if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
                 Copy-Item -LiteralPath $_.FullName -Destination $destPath -Force -ErrorAction Stop
+            }
+        }
+
+        # CONFIRMED PATTERN across five separate real msiexec 1308 errors,
+        # each found one at a time: register_x64.vbs, check_vc_x64.vbs,
+        # PlantronicsDevices.xml, qt.conf, and zac.ico were ALL sitting
+        # flat at the TOP LEVEL of the source folder, and ALL needed at
+        # the SAME nested "program files\Zultys\ZAC\" destination path.
+        # An earlier attempt at querying ZAC.msi's own internal database
+        # to find this list automatically and authoritatively did not
+        # pan out after two separate tries at the COM/SQL details -- that
+        # approach is set aside for now in favor of this simpler, more
+        # reliable fix grounded directly in the observed pattern: mirror
+        # EVERY flat, top-level file from the source into the nested
+        # destination too, rather than maintaining a per-file list that
+        # needs a new round-trip every time the MSI turns out to need one
+        # more sibling file than the last test found.
+        $nestedDestDir = Join-Path $StageDir $nestedSiblingDir
+        if (-not (Test-Path $nestedDestDir)) { New-Item -Path $nestedDestDir -ItemType Directory -Force | Out-Null }
+        Get-ChildItem -LiteralPath $sourceDir -File -ErrorAction Stop | ForEach-Object {
+            $nestedDest = Join-Path $nestedDestDir $_.Name
+            if (-not (Test-Path -LiteralPath $nestedDest)) {
+                Copy-Item -LiteralPath $_.FullName -Destination $nestedDest -Force -ErrorAction Stop
             }
         }
 
