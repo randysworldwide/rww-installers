@@ -96,6 +96,106 @@ if (-not (Test-IsElevated)) {
     exit 3
 }
 
+function Get-MsiUncompressedFileRelativePaths {
+    # Queries the MSI's own internal Windows Installer database for files
+    # explicitly marked "noncompressed" (msidbFileAttributesNoncompressed,
+    # bit 0x2000 in the File table's Attributes column) -- exactly the
+    # category of file that gets left as a loose, uncompressed file
+    # alongside the MSI rather than packed into its compressed cabinet.
+    # register_x64.vbs, check_vc_x64.vbs, and PlantronicsDevices.xml were
+    # ALL discovered this same way, one at a time, through three separate
+    # real msiexec 1308 errors across three separate test cycles -- this
+    # exists so a fourth such file doesn't need the same slow discovery
+    # cycle, by asking the MSI directly for the complete, authoritative
+    # list instead of relying on a manually-maintained one.
+    #
+    # UNVERIFIED IN LIVE TESTING: this uses the Windows Installer COM
+    # automation API (WindowsInstaller.Installer), which can't be
+    # exercised from this development environment the way plain
+    # PowerShell logic can -- flagging that honestly. Wrapped so ANY
+    # failure here (a COM interop detail, a DefaultDir parsing edge case,
+    # etc.) falls back silently to the known $criticalSiblingFiles list
+    # in Main rather than breaking the install over an enhancement that
+    # was meant to help.
+    param([string]$MsiPath)
+
+    $NoncompressedBit = 0x2000
+    $installer = $null
+    $db = $null
+
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $db = $installer.OpenDatabase($MsiPath, 0)
+
+        # Directory table lookup: DirectoryId -> @{ Parent; Name }
+        $dirLookup = @{}
+        $dirView = $db.OpenView("SELECT Directory, Directory_Parent, DefaultDir FROM Directory")
+        $dirView.Execute()
+        while ($rec = $dirView.Fetch()) {
+            $dirId      = $rec.StringData(1)
+            $parentId   = $rec.StringData(2)
+            $defaultDir = $rec.StringData(3)
+            # DefaultDir is "8.3SHORT|LongName", or just one name with no pipe.
+            $longName = $defaultDir
+            if ($defaultDir -and $defaultDir.Contains('|')) {
+                $longName = $defaultDir.Split('|')[1]
+            }
+            $dirLookup[$dirId] = @{ Parent = $parentId; Name = $longName }
+        }
+
+        function Resolve-MsiDirRelativePath {
+            param([string]$DirId, [hashtable]$Lookup)
+            $parts = @()
+            $current = $DirId
+            $seen = @{}
+            while ($current -and $Lookup.ContainsKey($current) -and -not $seen.ContainsKey($current)) {
+                $seen[$current] = $true
+                $entry = $Lookup[$current]
+                # '.' means "same folder as parent" -- no path segment of
+                # its own. Root markers contribute nothing either, since
+                # they represent the root itself, not a real subfolder.
+                if ($entry.Name -and $entry.Name -ne '.' -and $entry.Name -notin @('TARGETDIR', 'SourceDir')) {
+                    $parts = @($entry.Name) + $parts
+                }
+                $current = $entry.Parent
+            }
+            return ($parts -join '\')
+        }
+
+        $results = @()
+        $fileView = $db.OpenView("SELECT File.FileName, File.Attributes, Component.Directory_ FROM File, Component WHERE File.Component_ = Component.Component")
+        $fileView.Execute()
+        while ($rec = $fileView.Fetch()) {
+            $fileNameRaw = $rec.StringData(1)
+            $attributes  = $rec.IntegerData(2)
+            $dirId       = $rec.StringData(3)
+
+            if (($attributes -band $NoncompressedBit) -ne 0) {
+                $longFileName = $fileNameRaw
+                if ($fileNameRaw -and $fileNameRaw.Contains('|')) {
+                    $longFileName = $fileNameRaw.Split('|')[1]
+                }
+                $dirRelative = Resolve-MsiDirRelativePath -DirId $dirId -Lookup $dirLookup
+                if ($dirRelative) {
+                    $results += Join-Path $dirRelative $longFileName
+                } else {
+                    $results += $longFileName
+                }
+            }
+        }
+
+        return $results
+    } catch {
+        Write-Log "Dynamic MSI uncompressed-file query failed (this is a best-effort enhancement -- falling back to the known baseline list): $($_.Exception.Message)" 'WARN'
+        return @()
+    } finally {
+        # Explicit COM cleanup -- these can hold a file lock on the MSI
+        # otherwise, rather than waiting on .NET garbage collection.
+        if ($db) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($db) }
+        if ($installer) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
+    }
+}
+
 function Test-ZACInstalled {
     $hives = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -133,7 +233,26 @@ if (-not $sourceDir) {
     exit 2
 }
 
-$criticalSiblingFile = 'program files\Zultys\ZAC\register_x64.vbs'
+$criticalSiblingFiles = @(
+    'program files\Zultys\ZAC\register_x64.vbs',
+    'program files\Zultys\ZAC\check_vc_x64.vbs',
+    'program files\Zultys\ZAC\PlantronicsDevices.xml'
+)
+
+Write-Log "Querying ZAC.msi's own internal database for the complete, authoritative list of uncompressed sibling files (in addition to the three already known from previous testing)."
+$dynamicSiblingFiles = Get-MsiUncompressedFileRelativePaths -MsiPath (Join-Path $sourceDir $MsiFileName)
+if ($dynamicSiblingFiles.Count -gt 0) {
+    Write-Log "MSI database query found $($dynamicSiblingFiles.Count) uncompressed file(s): $($dynamicSiblingFiles -join ', ')"
+    foreach ($df in $dynamicSiblingFiles) {
+        if ($criticalSiblingFiles -notcontains $df) {
+            Write-Log "Adding newly-discovered uncompressed file to the check list: $df"
+            $criticalSiblingFiles += $df
+        }
+    }
+} else {
+    Write-Log "Dynamic MSI query found nothing (or the query itself failed -- see any warning above) -- proceeding with the known baseline list only: $($criticalSiblingFiles -join ', ')" 'WARN'
+}
+
 $stagingAttempts = 3
 $stagedOk = $false
 
@@ -142,13 +261,15 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
         if (Test-Path $StageDir) { Remove-Item -Path $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
         New-Item -Path $StageDir -ItemType Directory -Force | Out-Null
 
-        # ZAC.msi is a "compressed MSI" that also relies on some files
-        # stored UNCOMPRESSED alongside it (e.g. register_x64.vbs, under a
+        # ZAC.msi is a "compressed MSI" that also relies on files stored
+        # UNCOMPRESSED alongside it (confirmed to be at least TWO such
+        # files -- register_x64.vbs AND check_vc_x64.vbs, both under a
         # "program files\Zultys\ZAC\" subfolder relative to the MSI's own
-        # location) -- copying only ZAC.msi itself fails with a 1309/1603
-        # error because those sibling files are missing. Stage the whole
-        # source folder as a unit instead, same reasoning as
-        # AcroProInst.ps1.
+        # location -- there may be others neither of these two rounds of
+        # testing happened to exercise) -- copying only ZAC.msi itself
+        # fails with a 1308/1309/1603 error because those sibling files
+        # are missing. Stage the whole source folder as a unit instead,
+        # same reasoning as AcroProInst.ps1.
         Write-Log "Staging entire ZAC source folder to $StageDir (attempt $stageAttempt/$stagingAttempts) -- ZAC.msi relies on sibling uncompressed files, not just the bare MSI"
 
         # -ErrorAction Stop on BOTH calls below is deliberate: confirmed in
@@ -172,36 +293,43 @@ for ($stageAttempt = 1; $stageAttempt -le $stagingAttempts; $stageAttempt++) {
             }
         }
 
-        # Explicit sanity check: confirmed in testing that the copy loop
-        # above can complete with no exception at all, yet this specific
-        # file still be missing locally afterward -- verify it directly
-        # rather than assuming "no exception" means "complete copy".
-        $localSiblingCheck = Join-Path $StageDir $criticalSiblingFile
-        if (-not (Test-Path -LiteralPath $localSiblingCheck)) {
-            # FALLBACK: confirmed in practice that the share can end up
-            # with this file present but NOT at the nested path the MSI's
-            # own directory table expects -- e.g. if the share gets
-            # re-populated by copying an already-INSTALLED ZAC folder
-            # (C:\Program Files (x86)\Zultys\ZAC, a flat destination
-            # layout) rather than the original administrative-install
-            # source package (which has it nested under
-            # "program files\Zultys\ZAC\"). Rather than require the
-            # share's layout to exactly match what the MSI wants, search
-            # the whole source tree for a file with this exact name and,
-            # if found anywhere, place it at the correct nested path
-            # ourselves.
-            $siblingFileName = Split-Path -Path $criticalSiblingFile -Leaf
-            $fallbackMatch = Get-ChildItem -LiteralPath $sourceDir -Recurse -Filter $siblingFileName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($fallbackMatch) {
-                Write-Log "'$siblingFileName' wasn't at the expected nested path ($criticalSiblingFile), but was found elsewhere on the source ($($fallbackMatch.FullName)) -- copying it into the location the MSI actually expects."
-                $destParent = Split-Path -Path $localSiblingCheck -Parent
-                if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
-                Copy-Item -LiteralPath $fallbackMatch.FullName -Destination $localSiblingCheck -Force -ErrorAction Stop
+        # Explicit sanity check for EACH critical sibling file: confirmed
+        # in testing that the copy loop above can complete with no
+        # exception at all, yet a specific expected file still be missing
+        # locally afterward -- verify each one directly rather than
+        # assuming "no exception" means "complete copy".
+        $stillMissing = @()
+        foreach ($criticalFile in $criticalSiblingFiles) {
+            $localCheck = Join-Path $StageDir $criticalFile
+            if (-not (Test-Path -LiteralPath $localCheck)) {
+                # FALLBACK: confirmed in practice that the share can end up
+                # with a needed file present but NOT at the nested path the
+                # MSI's own directory table expects -- e.g. if the share
+                # gets re-populated by copying an already-INSTALLED ZAC
+                # folder (C:\Program Files (x86)\Zultys\ZAC, a flat
+                # destination layout) rather than the original
+                # administrative-install source package (which has these
+                # nested under "program files\Zultys\ZAC\"). Rather than
+                # require the share's layout to exactly match what the MSI
+                # wants, search the whole source tree for a file with this
+                # exact name and, if found anywhere, place it at the
+                # correct nested path ourselves.
+                $fileName = Split-Path -Path $criticalFile -Leaf
+                $fallbackMatch = Get-ChildItem -LiteralPath $sourceDir -Recurse -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($fallbackMatch) {
+                    Write-Log "'$fileName' wasn't at the expected nested path ($criticalFile), but was found elsewhere on the source ($($fallbackMatch.FullName)) -- copying it into the location the MSI actually expects."
+                    $destParent = Split-Path -Path $localCheck -Parent
+                    if (-not (Test-Path $destParent)) { New-Item -Path $destParent -ItemType Directory -Force | Out-Null }
+                    Copy-Item -LiteralPath $fallbackMatch.FullName -Destination $localCheck -Force -ErrorAction Stop
+                }
+            }
+            if (-not (Test-Path -LiteralPath $localCheck)) {
+                $stillMissing += $criticalFile
             }
         }
 
-        if (-not (Test-Path -LiteralPath $localSiblingCheck)) {
-            throw "Staging completed without error, but $criticalSiblingFile is still missing locally afterward (also not found anywhere else on the source under a different layout)."
+        if ($stillMissing.Count -gt 0) {
+            throw "Staging completed without error, but still missing locally afterward (also not found anywhere else on the source under a different layout): $($stillMissing -join ', ')"
         }
 
         $localMsi = Join-Path $StageDir $MsiFileName
