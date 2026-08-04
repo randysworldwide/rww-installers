@@ -661,7 +661,25 @@ function Show-ProgressGui {
     })
 
     # --- Background runspace that does the actual installing ---
+    # CONFIRMED ROOT CAUSE OF A REAL FREEZE, VIA REAL TEST LOGS: this
+    # runspace was created without ever setting ApartmentState, which
+    # means it defaulted to MTA (Multi-Threaded Apartment). WinForms
+    # fundamentally requires STA threading, and creating/showing a Form
+    # (Show-CredentialDialog / Show-ShareCredentialDialog, both of which
+    # run inside THIS runspace via .ShowDialog()) from an MTA thread is a
+    # well-documented source of instability -- it can corrupt or freeze
+    # the OTHER thread's WinForms message pump (the main progress window
+    # on the main STA thread) while the actual script execution
+    # underneath keeps running fine, since the freeze is in the UI layer,
+    # not the PowerShell execution itself. This exactly matches a real
+    # report: the progress window froze right at Join Domain (the first
+    # point a WinForms dialog gets shown from this runspace), while the
+    # console/log kept showing installs actually completing underneath.
+    # Fixed by explicitly setting STA before opening, matching the main
+    # thread's own apartment state (the whole process is launched with
+    # -STA in Apps-Deploy-Menu.bat).
     $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
     $runspace.Open()
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
