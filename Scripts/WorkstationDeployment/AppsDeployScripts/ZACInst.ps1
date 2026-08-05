@@ -168,7 +168,20 @@ try {
 $exeArgs = '/s /v"/qn REBOOT=ReallySuppress /norestart"'
 Write-Log "Running: $localExe $exeArgs (timeout ${InstallTimeoutSeconds}s)"
 
-$proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -PassThru -WindowStyle Hidden
+# CONCRETE STRUCTURAL DIFFERENCE, FOUND VIA COMPARISON: this used to use
+# -WindowStyle Hidden, which is the ONLY thing that was actually different
+# between this script and the three others with a similar timeout-guarded
+# Start-Process call (CiscoSecureClientInst.ps1, MXAdminInst.ps1,
+# OutlookClassicInst.ps1) -- all three of THOSE use -NoNewWindow instead,
+# and none of them exhibited this freeze. -WindowStyle Hidden (without
+# -NoNewWindow) makes Start-Process use ShellExecuteEx internally -- a
+# COM-based, shell-level API with its own STA threading and message-
+# pumping requirements during the launch itself, not just while waiting
+# afterward. -NoNewWindow instead uses CreateProcess directly, with no
+# COM/shell involvement at all. Switched to match the other three scripts
+# exactly, removing this COM-based code path as a possible contributor to
+# a real, confirmed freeze that happens specifically at this exact point.
+$proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -PassThru -NoNewWindow
 
 # CONFIRMED IN TESTING: this used to call $proc.WaitForExit(ms) directly
 # -- a blocking .NET call. This is the ONLY script in the whole project
