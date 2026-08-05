@@ -305,9 +305,12 @@ $script:AppManifest = @(
     # Runs before Initial Setup on purpose -- these are all machine-
     # stability/cleanup steps meant to happen before the bulk of app
     # downloads and installs, not alongside them. See the informational
-    # banner rendered between this category and Initial Setup in
-    # Show-SelectionGui for the related guidance about running Windows
-    # Update + Dell Command Update between these two categories.
+    # banner rendered before this category in Show-SelectionGui for the
+    # related guidance about running Windows Update + Dell Command
+    # Update before starting here.
+    @{ Name = 'Mute Volume';                      Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MuteInst.ps1'
+       Note = "Sets mute (doesn't toggle it). Least-verified script in this project -- uses hand-written COM interop with no way to compile-test it outside a real Windows box." }
     @{ Name = 'Set Brightness to 50%';            Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/BrightnessInst.ps1'
        Note = "Only works on laptop-integrated panels; most external desktop monitors don't support this and it will just skip harmlessly." }
@@ -433,9 +436,6 @@ $script:AppManifest = @(
     # header for why. Apps-Deploy-Menu.ps1 builds its selection list by
     # walking this array in order, so as long as Reboot stays last here,
     # it's guaranteed to run last whenever it's checked.
-    @{ Name = 'Mute Volume';                      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MuteInst.ps1'
-       Note = "Sets mute (doesn't toggle it). Least-verified script in this project -- uses hand-written COM interop with no way to compile-test it outside a real Windows box." }
     @{ Name = 'Remove Throwaway Setup Account';   Category = 'Finishing Touches'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/RemoveThrowawayAccountInst.ps1'
        Note = "Defaults OFF, same as Reboot Computer -- account deletion is consequential enough to require a deliberate click. Schedules removal for the next startup instead of deleting immediately (can't delete the account running this script)." }
