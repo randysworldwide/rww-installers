@@ -454,7 +454,7 @@ $script:CategoryOrder = @('Preparation', 'Initial Setup', 'Conditional', 'Option
 # belongs at a specific point in the flow rather than as a tooltip on any
 # single app. Keyed by which category the banner should appear before.
 $script:CategoryInfoBanners = @{
-    'Initial Setup' = "Before continuing: run a full round of Windows Update, then a round of Dell Command | Update, and reboot if either applies updates. Getting the machine current here first makes Windows more stable for the app downloads and installs below."
+    'Preparation' = "Before starting: Run a full round of Windows Updates and reboot when prompted, then a round of Dell Command | Updates and do the same. Getting the machine current here first makes Windows more stable for the app downloads and installs below."
 }
 
 # ---------------------------------------------------------------------------
