@@ -301,6 +301,27 @@ public static extern IntPtr GetConsoleWindow();
 #
 # DefaultOn reflects the checkbox state when the menu first draws.
 $script:AppManifest = @(
+    # --- Preparation ---
+    # Runs before Initial Setup on purpose -- these are all machine-
+    # stability/cleanup steps meant to happen before the bulk of app
+    # downloads and installs, not alongside them. See the informational
+    # banner rendered between this category and Initial Setup in
+    # Show-SelectionGui for the related guidance about running Windows
+    # Update + Dell Command Update between these two categories.
+    @{ Name = 'Set Brightness to 50%';            Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/BrightnessInst.ps1'
+       Note = "Only works on laptop-integrated panels; most external desktop monitors don't support this and it will just skip harmlessly." }
+    @{ Name = 'Power Settings (Plugged In)';      Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerPluggedInInst.ps1'
+       Note = "Screen off after 20 min, sleep after 60 min, while plugged in -- prevents the machine dimming/sleeping mid-deployment." }
+    @{ Name = 'Power Settings (On Battery)';      Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerOnBatteryInst.ps1'
+       Note = "Screen off after 10 min, sleep after 20 min, while on battery. Harmless (and irrelevant) on a desktop with no battery." }
+    @{ Name = 'Remove OEM Bloatware';             Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DebloatOEMInst.ps1'
+       NeedsShareCredentials = $true
+       Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer (via Appx) and ALL pre-installed Office/OneNote (via ODT Remove-All, every language including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
+
     # --- Initial Setup ---
     @{ Name = 'Enable Administrator Account';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/EnableAdminAccountInst.ps1'
@@ -311,10 +332,6 @@ $script:AppManifest = @(
     @{ Name = 'Join Domain (rpsinc.ringpinion.com)'; Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DomainJoinInst.ps1'
        Note = "Prompts for its OWN AD credentials, separate from the file-share prompt -- domain-join rights aren't the same as share-read rights. No auto-restart; a manual restart is needed afterward for it to fully take effect." }
-    @{ Name = 'Remove OEM Bloatware';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DebloatOEMInst.ps1'
-       NeedsShareCredentials = $true
-       Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer (via Appx) and ALL pre-installed Office/OneNote (via ODT Remove-All, every language including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
     @{ Name = 'ConnectWise Agent';              Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CWAgentInst.ps1'
        NeedsShareCredentials = $true
@@ -419,15 +436,6 @@ $script:AppManifest = @(
     @{ Name = 'Mute Volume';                      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MuteInst.ps1'
        Note = "Sets mute (doesn't toggle it). Least-verified script in this project -- uses hand-written COM interop with no way to compile-test it outside a real Windows box." }
-    @{ Name = 'Set Brightness to 50%';            Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/BrightnessInst.ps1'
-       Note = "Only works on laptop-integrated panels; most external desktop monitors don't support this and it will just skip harmlessly." }
-    @{ Name = 'Power Settings (Plugged In)';      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerPluggedInInst.ps1'
-       Note = "Screen off after 20 min, sleep after 60 min, while plugged in -- prevents the machine dimming/sleeping mid-deployment." }
-    @{ Name = 'Power Settings (On Battery)';      Category = 'Finishing Touches'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerOnBatteryInst.ps1'
-       Note = "Screen off after 10 min, sleep after 20 min, while on battery. Harmless (and irrelevant) on a desktop with no battery." }
     @{ Name = 'Remove Throwaway Setup Account';   Category = 'Finishing Touches'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/RemoveThrowawayAccountInst.ps1'
        Note = "Defaults OFF, same as Reboot Computer -- account deletion is consequential enough to require a deliberate click. Schedules removal for the next startup instead of deleting immediately (can't delete the account running this script)." }
@@ -439,7 +447,15 @@ $script:AppManifest = @(
        Note = "Defaults OFF on purpose -- a reboot is consequential enough that it shouldn't happen without a deliberate click. Restarts ~20 seconds after this run finishes, giving time for the summary to render." }
 )
 
-$script:CategoryOrder = @('Initial Setup', 'Conditional', 'Optional', 'IT', 'Finishing Touches')
+$script:CategoryOrder = @('Preparation', 'Initial Setup', 'Conditional', 'Optional', 'IT', 'Finishing Touches')
+
+# Informational banners rendered BEFORE the named category, inline with
+# the checkbox groups but not selectable themselves -- for guidance that
+# belongs at a specific point in the flow rather than as a tooltip on any
+# single app. Keyed by which category the banner should appear before.
+$script:CategoryInfoBanners = @{
+    'Initial Setup' = "Before continuing: run a full round of Windows Update, then a round of Dell Command | Update, and reboot if either applies updates. Getting the machine current here first makes Windows more stable for the app downloads and installs below."
+}
 
 # ---------------------------------------------------------------------------
 # GUI stage 1: selection screen
@@ -503,6 +519,34 @@ function Show-SelectionGui {
     foreach ($cat in $script:CategoryOrder) {
         $items = @($script:AppManifest | Where-Object { $_.Category -eq $cat })
         if ($items.Count -eq 0) { continue }
+
+        if ($script:CategoryInfoBanners.ContainsKey($cat)) {
+            $bannerText = $script:CategoryInfoBanners[$cat]
+
+            $bannerPanel = New-Object System.Windows.Forms.Panel
+            $bannerPanel.Location = New-Object System.Drawing.Point(8, $y)
+            $bannerPanel.Size = New-Object System.Drawing.Size(465, 1)  # height finalized below, after measuring the label
+            $bannerPanel.BackColor = [System.Drawing.Color]::FromArgb(255, 250, 230)
+            $bannerPanel.BorderStyle = 'FixedSingle'
+
+            $bannerLabel = New-Object System.Windows.Forms.Label
+            $bannerLabel.Text = $bannerText
+            $bannerLabel.Location = New-Object System.Drawing.Point(10, 8)
+            $bannerLabel.Size = New-Object System.Drawing.Size(440, 0)
+            $bannerLabel.AutoSize = $false
+            $bannerLabel.Font = New-Object System.Drawing.Font($bannerLabel.Font, [System.Drawing.FontStyle]::Italic)
+            # Measure the wrapped text at this width to size the panel to
+            # fit exactly, rather than guessing a fixed height that could
+            # clip longer banner text or leave awkward empty space for
+            # shorter text.
+            $measured = [System.Windows.Forms.TextRenderer]::MeasureText($bannerText, $bannerLabel.Font, (New-Object System.Drawing.Size(440, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak)
+            $bannerLabel.Size = New-Object System.Drawing.Size(440, $measured.Height)
+            $bannerPanel.Controls.Add($bannerLabel)
+            $bannerPanel.Size = New-Object System.Drawing.Size(465, ($measured.Height + 16))
+
+            $scrollPanel.Controls.Add($bannerPanel)
+            $y += $bannerPanel.Height + 10
+        }
 
         $groupBox = New-Object System.Windows.Forms.GroupBox
         $groupBox.Text = $cat
