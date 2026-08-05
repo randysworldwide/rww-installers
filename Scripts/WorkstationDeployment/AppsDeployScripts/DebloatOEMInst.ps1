@@ -545,13 +545,26 @@ function Test-TargetStillPresent {
 }
 
 $anyFailed = $false
+
+# REQUESTED: these two specific targets are a KNOWN, already-diagnosed
+# limitation (their remaining component is InstallShield-wrapped and
+# genuinely needs a pre-recorded .iss response file to remove silently --
+# see Uninstall-ByRegistryMatch's own notes on this). Rather than either
+# ignoring failures everywhere (which would hide a real, NEW problem in
+# something else) or continuing to report the whole run as failed over
+# two already-understood stragglers, these two specifically don't count
+# toward $anyFailed -- every other target still does. Revisit removing
+# this exemption once the .iss-based fix is actually in place for both.
+$knownAcceptedStragglers = @('Dell Optimizer', 'Dell Watchdog Timer')
+
 foreach ($t in $targets) {
     Write-Log "--- $($t.DisplayName) ---"
+    $isAcceptedStraggler = $t.DisplayName -in $knownAcceptedStragglers
 
     $appxResult = @{ Found = $false; Ok = $true }
     if ($t.AppxSubstrings.Count -gt 0) {
         $appxResult = Uninstall-AppxIfPresent -DisplayName $t.DisplayName -AppxSubstrings $t.AppxSubstrings
-        if (-not $appxResult.Ok) { $anyFailed = $true }
+        if (-not $appxResult.Ok -and -not $isAcceptedStraggler) { $anyFailed = $true }
     }
 
     # CONFIRMED IN TESTING: some Dell apps (Watchdog Timer specifically)
@@ -563,11 +576,15 @@ foreach ($t in $targets) {
     # Always try both now, regardless of what the other one found.
     $issPath = if ($t.ContainsKey('IssSharePath')) { $t.IssSharePath } else { '' }
     $ok = Uninstall-ByRegistryMatch -DisplayName $t.DisplayName -NamePatterns $t.NamePatterns -IssSharePath $issPath
-    if (-not $ok) { $anyFailed = $true }
+    if (-not $ok -and -not $isAcceptedStraggler) { $anyFailed = $true }
 
     if (Test-TargetStillPresent -NamePatterns $t.NamePatterns -AppxSubstrings $t.AppxSubstrings) {
-        Write-Log "STILL PRESENT after the removal attempt(s) above -- treating as a failure despite the uninstall command(s) completing without an error." 'ERROR'
-        $anyFailed = $true
+        if ($isAcceptedStraggler) {
+            Write-Log "STILL PRESENT after the removal attempt(s) above -- known, accepted limitation for now (needs the .iss-based fix), not counted as an overall failure." 'WARN'
+        } else {
+            Write-Log "STILL PRESENT after the removal attempt(s) above -- treating as a failure despite the uninstall command(s) completing without an error." 'ERROR'
+            $anyFailed = $true
+        }
     } else {
         Write-Log "Confirmed gone."
     }
