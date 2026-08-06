@@ -182,6 +182,16 @@ Write-Log "Running: $localExe $exeArgs (timeout ${InstallTimeoutSeconds}s)"
 # exactly, removing this COM-based code path as a possible contributor to
 # a real, confirmed freeze that happens specifically at this exact point.
 $proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -PassThru -NoNewWindow
+# CONFIRMED VIA A REAL FAILURE (ZAC reported FAILED with an EMPTY exit
+# code while the install actually succeeded): Start-Process -PassThru
+# WITHOUT -Wait doesn't cache the process handle, and without it,
+# .ExitCode can come back $null once the process has exited -- a known
+# PowerShell gotcha. The old blocking WaitForExit() call implicitly
+# initialized the handle; the polling-loop replacement (the freeze fix)
+# removed that side effect. Touching .Handle immediately after launch is
+# the canonical fix -- it forces the handle to be cached while the
+# process is guaranteed to still exist.
+$null = $proc.Handle
 
 # CONFIRMED IN TESTING: this used to call $proc.WaitForExit(ms) directly
 # -- a blocking .NET call. This is the ONLY script in the whole project
@@ -219,6 +229,24 @@ if (-not $proc.HasExited) {
 
 $exitCode = $proc.ExitCode
 Write-Log "Installer exit code: $exitCode"
+
+# Defensive fallback for the same null-ExitCode gotcha the .Handle fix
+# above addresses: if the exit code STILL can't be read for some reason,
+# don't fail a possibly-successful install over an unreadable number --
+# fall through to the registry detection below, which is the actual
+# ground truth for whether ZAC ended up installed.
+if ($null -eq $exitCode) {
+    Write-Log "Exit code could not be read from the installer process -- falling back to registry detection as the ground truth instead of treating the unreadable code as a failure." 'WARN'
+    if (Test-ZACInstalled) {
+        Write-Log "ZAC confirmed present via registry."
+        Write-Log "=== Install-ZAC finished. Overall success: True (exit code unreadable, verified via registry) ==="
+        exit 0
+    } else {
+        Write-Log "ZAC not found in the registry either -- treating as a failure." 'ERROR'
+        Write-Log "=== Install-ZAC finished. Overall success: False ==="
+        exit 1
+    }
+}
 
 if ($exitCode -notin @(0, 3010, 1641)) {
     Write-Log "Install FAILED (exit code $exitCode)." 'ERROR'

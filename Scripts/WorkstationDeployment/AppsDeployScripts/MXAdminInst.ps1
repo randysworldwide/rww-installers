@@ -135,6 +135,16 @@ try {
 
 Write-Log "Running: $localExe /S (unverified switch -- see script header)"
 $proc = Start-Process -FilePath $localExe -ArgumentList '/S' -PassThru -NoNewWindow
+# CONFIRMED VIA A REAL FAILURE (ZAC reported FAILED with an EMPTY exit
+# code while the install actually succeeded): Start-Process -PassThru
+# WITHOUT -Wait doesn't cache the process handle, and without it,
+# .ExitCode can come back $null once the process has exited -- a known
+# PowerShell gotcha. The old blocking WaitForExit() call implicitly
+# initialized the handle; the polling-loop replacement (the freeze fix)
+# removed that side effect. Touching .Handle immediately after launch is
+# the canonical fix -- it forces the handle to be cached while the
+# process is guaranteed to still exist.
+$null = $proc.Handle
 
 # Polling instead of a blocking WaitForExit() call -- confirmed via real
 # testing on ZACInst.ps1 that raw Process.WaitForExit() on an STA thread
