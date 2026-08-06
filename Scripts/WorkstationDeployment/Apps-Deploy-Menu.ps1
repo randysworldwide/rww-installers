@@ -320,15 +320,15 @@ $script:AppManifest = @(
     @{ Name = 'Power Settings (On Battery)';      Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/PowerOnBatteryInst.ps1'
        Note = "Screen off after 10 min, sleep after 20 min, while on battery. Harmless (and irrelevant) on a desktop with no battery." }
+    @{ Name = 'Enable Administrator Account';    Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/EnableAdminAccountInst.ps1'
+       Note = "Prompts for a password at runtime (masked, with confirm). Defaults ON -- a known-good local admin fallback matters more once Remove Throwaway Setup Account has run." }
     @{ Name = 'Remove OEM Bloatware';             Category = 'Preparation'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DebloatOEMInst.ps1'
        NeedsShareCredentials = $true
        Note = "Removes Dell SupportAssist/Optimizer/Core Services/Trusted Device/Watchdog Timer (via Appx) and ALL pre-installed Office/OneNote (via ODT Remove-All, every language including English) -- the pre-installed copy is a different product from what's installed separately. Leaves Dell Command Update, Edge, OneDrive, and runtime dependencies alone on purpose." }
 
     # --- Initial Setup ---
-    @{ Name = 'Enable Administrator Account';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/EnableAdminAccountInst.ps1'
-       Note = "Prompts for a password at runtime (masked, with confirm). Defaults ON -- a known-good local admin fallback matters more once Remove Throwaway Setup Account has run." }
     @{ Name = 'Change Computer Name';            Category = 'Initial Setup'; DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ChangeComputerNameInst.ps1'
        Note = "Prompts for the new name at runtime. Runs before Join Domain on purpose -- renaming while still a workgroup machine only needs local admin rights, not domain permissions." }
@@ -346,21 +346,26 @@ $script:AppManifest = @(
        NeedsShareCredentials = $true
        Note = "Pulls its MSI from the private share, not GitHub. Uses the .msi, not the .exe also on the share." }
     @{ Name = 'Microsoft Visual Studio Code';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VSCodeInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VSCodeInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VSCodeUninst.ps1' }
     @{ Name = 'Windows Terminal';                 Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinTerminalInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinTerminalInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinTerminalUninst.ps1' }
     @{ Name = 'Cisco Secure Client';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CiscoSecureClientInst.ps1'
        NeedsShareCredentials = $true
        Note = "Runs a pre-built installer bundle from the private share -- handles the VPN profile and retries internally." }
     @{ Name = 'Microsoft .NET Desktop Runtime 8';   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DotNet8Inst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DotNet8Uninst.ps1'
        Note = "A dependency for other apps (e.g. Dell Command Update) -- installs first on purpose." }
     @{ Name = 'Dell Command | Update';           Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DCUInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/DCUUninst.ps1'
        Note = "Dell hardware only; harmless elsewhere. Occasional download failures are a Dell CDN issue, not this script." }
     @{ Name = 'VLC Media Player';                Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VLCInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VLCInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VLCUninst.ps1' }
     @{ Name = 'SentinelOne EDR';                 Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/SentinelOneInst.ps1'
        NeedsShareCredentials = $true
@@ -373,34 +378,44 @@ $script:AppManifest = @(
     # --- Conditional ---
     @{ Name = 'Office O365';                     Category = 'Conditional';   DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OfficeO365Inst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OfficeO365Uninst.ps1'
        NeedsShareCredentials = $true
+       UninstallNeedsShareCredentials = $true
        Note = "Uses ODT with the x64 config. Can take 10-20+ minutes. Mutually exclusive with Office Suite 2021." }
     @{ Name = 'Office Suite 2021';                Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/Office2021Inst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/Office2021Uninst.ps1'
        NeedsShareCredentials = $true
+       UninstallNeedsShareCredentials = $true
        Note = "Uses ODT with the 2021 volume-license config. Can take 10-20+ minutes. Mutually exclusive with Office O365." }
     @{ Name = 'Adobe Acrobat Pro';                Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroProInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroProUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Stages the full install folder, not just the MSI. Mutually exclusive with Acrobat Reader -- they can't coexist." }
     @{ Name = 'Adobe Acrobat Reader';             Category = 'Conditional';   DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroRdrInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/AcroRdrUninst.ps1'
        Note = "Free Reader only. Mutually exclusive with Acrobat Pro -- they can't coexist on the same machine." }
 
     # --- Optional ---
     @{ Name = 'Google Chrome';                    Category = 'Optional';      DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GChromeInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GChromeInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GChromeUninst.ps1' }
     @{ Name = 'Microsoft Outlook Classic';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OutlookClassicInst.ps1'
        NeedsShareCredentials = $true
        Note = "Silent by design, but unverified -- has a timeout safety net just in case." }
     @{ Name = 'Logi Options+';                    Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/LogiOptInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/LogiOptUninst.ps1'
        Note = "Doesn't force machine-wide install (known issue with that combo). May occasionally fail from an upstream hash mismatch." }
     @{ Name = '7-Zip';                            Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/7ZipInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/7ZipInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/7ZipUninst.ps1' }
     @{ Name = 'Claude';                           Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ClaudeInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ClaudeUninst.ps1'
        Note = "Installs per-user, not machine-wide -- run as the actual end user, not a technician's own account." }
     @{ Name = 'Project Professional 2021';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ProjectPro2021Inst.ps1'
@@ -414,16 +429,21 @@ $script:AppManifest = @(
     # --- IT ---
     @{ Name = 'Microsoft Visual C++ Redistributables'; Category = 'IT';       DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VCRedistInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VCRedistUninst.ps1'
        Note = "Installs both x64 and x86, since some apps expect x86 even on 64-bit Windows." }
     @{ Name = 'Java';                             Category = 'IT';            DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/JavaInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/JavaUninst.ps1'
        Note = "Installs Eclipse Temurin (OpenJDK), not Oracle's JDK -- avoids Oracle's licensing requirements." }
     @{ Name = 'Git';                              Category = 'IT';            DefaultOn = $false; Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GitInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GitInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GitUninst.ps1' }
     @{ Name = 'GitHub CLI';                       Category = 'IT';            DefaultOn = $false; Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GHCliInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GHCliInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GHCliUninst.ps1' }
     @{ Name = 'Node.js';                          Category = 'IT';            DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/NodeJSInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/NodeJSUninst.ps1'
        Note = "Installs the LTS line, not the latest -- safer default for business machines." }
     @{ Name = 'MXAdmin';                          Category = 'IT';            DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MXAdminInst.ps1'
@@ -449,6 +469,20 @@ $script:AppManifest = @(
 
 $script:CategoryOrder = @('Preparation', 'Initial Setup', 'Conditional', 'Optional', 'IT', 'Finishing Touches')
 
+# Install-mode setup profiles. Each profile is a name -> list of app
+# names to pre-check when that profile is chosen. The special value
+# $null means "use each app's own DefaultOn flag from the manifest"
+# (i.e. the classic default selection this menu has always had).
+# Adding a future computer-type profile is one line here, e.g.:
+#   'Warehouse PC' = @('ConnectWise Agent', 'ZAC Softphone', 'SentinelOne EDR')
+# Names must match the manifest's Name fields exactly. Apps not listed
+# simply start unchecked; the tech can still adjust anything by hand
+# before running.
+$script:InstallProfiles = [ordered]@{
+    'Standard (defaults)'      = $null
+    'Blank (nothing selected)' = @()
+}
+
 # Informational banners rendered BEFORE the named category, inline with
 # the checkbox groups but not selectable themselves -- for guidance that
 # belongs at a specific point in the flow rather than as a tooltip on any
@@ -468,7 +502,7 @@ function Show-SelectionGui {
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = if ($StartBlank) { 'rww-installers - Deployment Menu (blank mode)' } else { 'rww-installers - Deployment Menu' }
+    $form.Text = 'rww-installers - Deployment Menu'
     $form.Size = New-Object System.Drawing.Size(540, 660)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
@@ -494,17 +528,54 @@ function Show-SelectionGui {
     $tooltip.ReshowDelay = 100
     $tooltip.ShowAlways = $true
 
-    if ($StartBlank) {
-        $banner = New-Object System.Windows.Forms.Label
-        $banner.Text = 'Blank mode -- nothing pre-selected'
-        $banner.ForeColor = [System.Drawing.Color]::DimGray
-        $banner.Location = New-Object System.Drawing.Point(15, 8)
-        $banner.AutoSize = $true
-        $form.Controls.Add($banner)
-        $scrollTop = 30
-    } else {
-        $scrollTop = 8
+    # --- Mode selector: Install / Uninstall ---
+    # 'Install' pre-checks apps per the chosen profile below (a 'Blank
+    # (nothing selected)' profile covers the start-from-scratch case the
+    # old -StartBlank/.bat variant provided -- that switch now just
+    # starts in Install mode with that profile pre-selected).
+    # 'Uninstall' flips the whole menu into an uninstaller: each checked
+    # app runs its dedicated *Uninst.ps1 counterpart instead of its
+    # installer. Only apps that HAVE such a script are selectable in
+    # Uninstall mode -- the rest grey out rather than guessing at a
+    # destructive operation for something like SentinelOne (needs a
+    # passphrase) or Office (needs its own ODT flow).
+    $script:SelectionMode = 'Install'
+
+    $modeGroup = New-Object System.Windows.Forms.GroupBox
+    $modeGroup.Text = 'Mode'
+    $modeGroup.Location = New-Object System.Drawing.Point(10, 6)
+    $modeGroup.Size = New-Object System.Drawing.Size(505, 48)
+    $form.Controls.Add($modeGroup)
+
+    $rbInstall = New-Object System.Windows.Forms.RadioButton
+    $rbInstall.Text = 'Install'
+    $rbInstall.Location = New-Object System.Drawing.Point(12, 18)
+    $rbInstall.Size = New-Object System.Drawing.Size(70, 20)
+    $modeGroup.Controls.Add($rbInstall)
+
+    $rbUninstall = New-Object System.Windows.Forms.RadioButton
+    $rbUninstall.Text = 'Uninstall'
+    $rbUninstall.Location = New-Object System.Drawing.Point(92, 18)
+    $rbUninstall.Size = New-Object System.Drawing.Size(85, 20)
+    $modeGroup.Controls.Add($rbUninstall)
+
+    $lblProfile = New-Object System.Windows.Forms.Label
+    $lblProfile.Text = 'Profile:'
+    $lblProfile.Location = New-Object System.Drawing.Point(200, 20)
+    $lblProfile.Size = New-Object System.Drawing.Size(50, 18)
+    $modeGroup.Controls.Add($lblProfile)
+
+    $cmbProfile = New-Object System.Windows.Forms.ComboBox
+    $cmbProfile.DropDownStyle = 'DropDownList'
+    $cmbProfile.Location = New-Object System.Drawing.Point(253, 16)
+    $cmbProfile.Size = New-Object System.Drawing.Size(240, 22)
+    foreach ($profileName in $script:InstallProfiles.Keys) {
+        [void]$cmbProfile.Items.Add($profileName)
     }
+    $cmbProfile.SelectedIndex = 0
+    $modeGroup.Controls.Add($cmbProfile)
+
+    $scrollTop = 60
 
     $scrollPanel = New-Object System.Windows.Forms.Panel
     $scrollPanel.AutoScroll = $true
@@ -565,15 +636,22 @@ function Show-SelectionGui {
             $isReady = ($app.Status -eq 'Ready')
             $cb.Checked = $isReady -and (-not $StartBlank) -and [bool]$app.DefaultOn
 
-            if (-not $isReady) {
-                $cb.ForeColor = [System.Drawing.Color]::Gray
-                # Enabled stays $true on purpose -- a disabled control suppresses
-                # WM_MOUSEMOVE, which would silently kill the tooltip too. Instead
-                # we let it be clicked, then immediately snap it back off.
-                $cb.Add_CheckedChanged({
-                    if ($this.Checked) { $this.Checked = $false }
-                })
-            }
+            # Mode-aware selectability, enforced by snap-back rather than
+            # Enabled=$false (a disabled control suppresses WM_MOUSEMOVE,
+            # which would silently kill the tooltip too): in Install mode
+            # an app must be Status='Ready'; in Uninstall mode it must
+            # ALSO have an UninstallRepoPath --
+            # apps without a dedicated uninstall script can't be picked
+            # for a destructive operation we'd just be guessing at.
+            $cb.Add_CheckedChanged({
+                if (-not $this.Checked) { return }
+                $a = $this.Tag
+                $allowed = ($a.Status -eq 'Ready')
+                if ($script:SelectionMode -eq 'Uninstall') {
+                    $allowed = $allowed -and $a.ContainsKey('UninstallRepoPath') -and $a.UninstallRepoPath
+                }
+                if (-not $allowed) { $this.Checked = $false }
+            })
 
             $noteParts = @()
             switch ($app.Status) {
@@ -635,6 +713,10 @@ function Show-SelectionGui {
 
     foreach ($cb in $partnerOf.Keys) {
         $cb.Add_CheckedChanged({
+            # Mutual exclusion is an INSTALL-time constraint (two things
+            # that can't be installed together) -- it has no meaning when
+            # picking things to uninstall, so it's suspended in that mode.
+            if ($script:SelectionMode -eq 'Uninstall') { return }
             $partner = $partnerOf[$this]
             if ($this.Checked) {
                 $partner.Checked = $false
@@ -657,12 +739,89 @@ function Show-SelectionGui {
         }
     }
 
+    # --- Mode application ---
+    # Re-derives every checkbox's checked state, colour, and the run
+    # button's wording from the current mode + profile. Called on every
+    # mode radio change and profile change; also called once below to
+    # make the initial render consistent with whatever mode we start in.
+    function Apply-SelectionMode {
+        param([string]$Mode)
+
+        $script:SelectionMode = $Mode
+        $lblProfile.Visible = ($Mode -eq 'Install')
+        $cmbProfile.Visible = ($Mode -eq 'Install')
+
+        $profileAppNames = $null
+        if ($Mode -eq 'Install' -and $cmbProfile.SelectedItem) {
+            $profileAppNames = $script:InstallProfiles[[string]$cmbProfile.SelectedItem]
+        }
+
+        foreach ($app in $checkboxByApp.Keys) {
+            $cb = $checkboxByApp[$app]
+            $isReady = ($app.Status -eq 'Ready')
+            $hasUninstall = $app.ContainsKey('UninstallRepoPath') -and $app.UninstallRepoPath
+
+            switch ($Mode) {
+                'Install' {
+                    if ($null -eq $profileAppNames) {
+                        $cb.Checked = $isReady -and [bool]$app.DefaultOn
+                    } else {
+                        $cb.Checked = $isReady -and ($app.Name -in $profileAppNames)
+                    }
+                    $cb.ForeColor = if ($isReady) { [System.Drawing.Color]::Black } else { [System.Drawing.Color]::Gray }
+                    $cb.Enabled = $true
+                }
+                'Uninstall' {
+                    $cb.Checked = $false
+                    $cb.ForeColor = if ($isReady -and $hasUninstall) { [System.Drawing.Color]::Black } else { [System.Drawing.Color]::Gray }
+                    $cb.Enabled = $true
+                }
+            }
+        }
+
+        # Re-sync mutual-exclusion partner enabling for install modes
+        # (uninstall mode leaves everything enabled -- exclusion doesn't
+        # apply there).
+        if ($Mode -ne 'Uninstall') {
+            foreach ($cb in $partnerOf.Keys) {
+                $cb.Enabled = $true
+            }
+            foreach ($cb in $partnerOf.Keys) {
+                if ($cb.Checked) { $partnerOf[$cb].Enabled = $false }
+            }
+        }
+
+        $btnRun.Text = if ($Mode -eq 'Uninstall') { 'Uninstall Selected' } else { 'Install Selected' }
+    }
+
+    $rbInstall.Add_CheckedChanged({   if ($this.Checked) { Apply-SelectionMode -Mode 'Install' } })
+    $rbUninstall.Add_CheckedChanged({ if ($this.Checked) { Apply-SelectionMode -Mode 'Uninstall' } })
+    $cmbProfile.Add_SelectedIndexChanged({
+        if ($script:SelectionMode -eq 'Install') { Apply-SelectionMode -Mode 'Install' }
+    })
+
     $btnRun = New-Object System.Windows.Forms.Button
     $btnRun.Text = 'Install Selected'
     $btnRun.Location = New-Object System.Drawing.Point(300, ($scrollTop + 565))
     $btnRun.Size = New-Object System.Drawing.Size(210, 34)
-    $btnRun.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnRun)
+    # DialogResult is set in the click handler rather than preassigned,
+    # so the uninstall confirmation below can veto closing the form.
+    $btnRun.Add_Click({
+        if ($script:SelectionMode -eq 'Uninstall') {
+            $checkedCount = @($checkboxByApp.Values | Where-Object { $_.Checked }).Count
+            if ($checkedCount -gt 0) {
+                $confirm = [System.Windows.Forms.MessageBox]::Show(
+                    "This will UNINSTALL the $checkedCount selected app(s) from this machine. Continue?",
+                    'rww-installers - Confirm uninstall',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning)
+                if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            }
+        }
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
+    })
 
     $btnQuit = New-Object System.Windows.Forms.Button
     $btnQuit.Text = 'Quit'
@@ -674,6 +833,13 @@ function Show-SelectionGui {
     $form.AcceptButton = $btnRun
     $form.CancelButton = $btnQuit
     $form.ClientSize = New-Object System.Drawing.Size(535, ($scrollTop + 615))
+
+    # Set the starting mode/profile LAST, after everything (including
+    # $btnRun) exists -- checking a radio (or changing the profile
+    # selection) fires handlers that call Apply-SelectionMode, which
+    # touches $btnRun.
+    if ($StartBlank) { $cmbProfile.SelectedItem = 'Blank (nothing selected)' }
+    $rbInstall.Checked = $true
 
     $result = $form.ShowDialog()
     $form.Dispose()
@@ -700,7 +866,9 @@ function Show-SelectionGui {
             $selected += $app
         }
     }
-    return $selected
+
+    $effectiveMode = if ($script:SelectionMode -eq 'Uninstall') { 'Uninstall' } else { 'Install' }
+    return @{ Mode = $effectiveMode; Apps = $selected }
 }
 
 # ---------------------------------------------------------------------------
@@ -720,7 +888,8 @@ function Show-ProgressGui {
         [string]$LocalRoot = '',
         [string]$ResumeStateFile = '',
         [string]$ResumeTaskName = '',
-        [string]$SelfScriptPath = ''
+        [string]$SelfScriptPath = '',
+        [ValidateSet('Install','Uninstall')][string]$Mode = 'Install'
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -730,12 +899,14 @@ function Show-ProgressGui {
     # --- Thread-safe state shared between the UI thread and the worker runspace ---
     $logQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
     $state = [hashtable]::Synchronized(@{
-        CurrentApp    = ''
-        Index         = 0
-        Total         = $Apps.Count
-        AppDone       = $false
-        AllDone       = $false
-        FinalExitCode = 0
+        CurrentApp     = ''
+        Index          = 0
+        Total          = $Apps.Count
+        AppDone        = $false
+        AllDone        = $false
+        FinalExitCode  = 0
+        PauseRequested = $false
+        IsPaused       = $false
     })
 
     # --- Background runspace that does the actual installing ---
@@ -763,7 +934,7 @@ function Show-ProgressGui {
     $ps.Runspace = $runspace
 
     $workerScript = {
-        param($Apps, $LogPath, $StagingDir, $RepoOwner, $RepoName, $Branch, $QueueRef, $StateRef, $UseLocal, $LocalRoot, $ResumeStateFile, $ResumeTaskName, $SelfScriptPath)
+        param($Apps, $LogPath, $StagingDir, $RepoOwner, $RepoName, $Branch, $QueueRef, $StateRef, $UseLocal, $LocalRoot, $ResumeStateFile, $ResumeTaskName, $SelfScriptPath, $Mode)
 
         # $Global:RWWQueue (not just a local variable) so that Write-Log calls
         # inside downloaded child scripts -- which may be many function-call
@@ -999,7 +1170,7 @@ function Show-ProgressGui {
         }
 
         try {
-            Write-WorkerLog "=== Apps-Deploy-Menu install run starting ==="
+            Write-WorkerLog "=== Apps-Deploy-Menu $(if ($Mode -eq 'Uninstall') { 'UNINSTALL' } else { 'install' }) run starting ==="
             Write-WorkerLog ("Selected: " + (($Apps | ForEach-Object { $_.Name }) -join ', '))
 
             # If both Change Computer Name and Join Domain are selected in
@@ -1028,6 +1199,21 @@ function Show-ProgressGui {
             $i = 0
             $shareCredentialsHandled = $false
             foreach ($app in $Apps) {
+                # Pause happens BETWEEN apps only, never mid-install --
+                # deliberately checked here, before anything for the next
+                # app starts, so whatever's currently running always
+                # finishes normally first. Interrupting an installer
+                # mid-execution (suspending or killing it) is genuinely
+                # risky -- it could leave file locks held or a machine in
+                # a partially-installed state -- so pausing only ever
+                # delays the START of the next app, never touches one
+                # already in progress.
+                while ($StateRef.PauseRequested) {
+                    $StateRef.IsPaused = $true
+                    Start-Sleep -Milliseconds 300
+                }
+                $StateRef.IsPaused = $false
+
                 $i++
                 $StateRef.Index = $i
                 $StateRef.CurrentApp = $app.Name
@@ -1036,13 +1222,28 @@ function Show-ProgressGui {
                 Write-WorkerLog ""
                 Write-WorkerLog "--- $($app.Name) ($i of $($Apps.Count)) ---"
 
-                if ($app.NeedsShareCredentials -and -not $shareCredentialsHandled) {
+                # Which flag governs the share prompt depends on the run
+                # direction: an app's INSTALL needing the share doesn't
+                # mean its UNINSTALL does (e.g. Acrobat Pro installs from
+                # the share but uninstalls entirely locally via Windows'
+                # cached MSI), and vice versa isn't automatic either
+                # (Office uninstalls DO need the share for setup.exe --
+                # marked explicitly via UninstallNeedsShareCredentials).
+                $appNeedsShareNow = if ($Mode -eq 'Uninstall') {
+                    $app.ContainsKey('UninstallNeedsShareCredentials') -and $app.UninstallNeedsShareCredentials
+                } else {
+                    [bool]$app.NeedsShareCredentials
+                }
+                if ($appNeedsShareNow -and -not $shareCredentialsHandled) {
                     $shareCredentialsHandled = $true
                     # Include the CURRENT app in the "who needs this"
                     # message, not just what comes after it -- $i is
                     # already this app's own 1-based position at this
                     # point in the loop, so ($i-1) is its 0-based index.
-                    $upcomingShareApps = @($Apps[($i - 1)..($Apps.Count - 1)] | Where-Object { $_.NeedsShareCredentials })
+                    $upcomingShareApps = @($Apps[($i - 1)..($Apps.Count - 1)] | Where-Object {
+                        if ($Mode -eq 'Uninstall') { $_.ContainsKey('UninstallNeedsShareCredentials') -and $_.UninstallNeedsShareCredentials }
+                        else { [bool]$_.NeedsShareCredentials }
+                    })
                     $shareOk = Request-ShareAccessIfNeededInWorker -SelectedApps $upcomingShareApps
                     if (-not $shareOk) {
                         Write-WorkerLog "Aborting run -- share credentials could not be established. See error above." 'ERROR'
@@ -1052,7 +1253,13 @@ function Show-ProgressGui {
                     }
                 }
 
-                $code = Invoke-RemoteInstallScript -RepoPath $app.InstallRepoPath
+                # Uninstall mode runs each app's dedicated *Uninst.ps1
+                # counterpart instead of its installer. The selection GUI
+                # only lets apps WITH an UninstallRepoPath be checked in
+                # that mode, so this lookup can't come up empty for a
+                # legitimately-selected app.
+                $repoPathToRun = if ($Mode -eq 'Uninstall') { $app.UninstallRepoPath } else { $app.InstallRepoPath }
+                $code = Invoke-RemoteInstallScript -RepoPath $repoPathToRun
                 $ok = ($code -eq 0 -or $code -eq 4)   # 4 = "already installed", per existing scripts' convention
                 if ($ok) {
                     Write-WorkerLog "$($app.Name) finished (exit $code)."
@@ -1179,12 +1386,14 @@ function Show-ProgressGui {
     [void]$ps.AddArgument($ResumeStateFile)
     [void]$ps.AddArgument($ResumeTaskName)
     [void]$ps.AddArgument($SelfScriptPath)
+    [void]$ps.AddArgument($Mode)
 
     $asyncResult = $ps.BeginInvoke()
 
     # --- Progress form ---
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = if ($UseLocal) { 'rww-installers - Installing (LOCAL TEST MODE)' } else { 'rww-installers - Installing' }
+    $modeWord = if ($Mode -eq 'Uninstall') { 'Uninstalling' } else { 'Installing' }
+    $form.Text = if ($UseLocal) { "rww-installers - $modeWord (LOCAL TEST MODE)" } else { "rww-installers - $modeWord" }
     $form.Size = New-Object System.Drawing.Size(1280, 680)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'Sizable'
@@ -1262,6 +1471,39 @@ function Show-ProgressGui {
     $txtLog.ForeColor = [System.Drawing.Color]::LightGray
     $form.Controls.Add($txtLog)
 
+    $btnPause = New-Object System.Windows.Forms.Button
+    $btnPause.Text = 'Pause'
+    $btnPause.Location = New-Object System.Drawing.Point(1055, 590)
+    $btnPause.Size = New-Object System.Drawing.Size(100, 30)
+    $btnPause.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($btnPause)
+    $btnPause.Add_Click({
+        # Once the whole run is finished, this button has been converted
+        # into 'Continue' (see the AllDone block in the timer below) --
+        # clicking it closes this progress window and signals Main to
+        # loop back to a fresh selection menu, instead of pausing a run
+        # that no longer exists.
+        if ($state.AllDone) {
+            $script:RWWContinueRequested = $true
+            $form.Close()
+            return
+        }
+        if ($state.PauseRequested) {
+            # Resuming -- the click itself flips the flag; the worker's
+            # own wait loop picks this up and clears IsPaused within
+            # ~300ms on its own, no need to touch it here too.
+            $state.PauseRequested = $false
+            $btnPause.Text = 'Pause'
+        } else {
+            # Pausing -- only requests it. IsPaused (and the visible
+            # "Paused" state) only becomes true once the worker actually
+            # reaches its between-apps check, so whatever's currently
+            # running keeps going uninterrupted until it finishes.
+            $state.PauseRequested = $true
+            $btnPause.Text = 'Resume'
+        }
+    })
+
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Close'
     $btnClose.Location = New-Object System.Drawing.Point(1165, 590)
@@ -1274,6 +1516,7 @@ function Show-ProgressGui {
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 150
     $script:barDirection = 1
+    $script:RWWContinueRequested = $false
     $timer.Add_Tick({
         try {
             $line = $null
@@ -1287,12 +1530,19 @@ function Show-ProgressGui {
                 $txtLog.ScrollToCaret()
             }
 
-            if ($state.Index -gt 0) {
-                $lblCurrent.Text = "Installing: $($state.CurrentApp)"
+            if ($state.IsPaused) {
+                $lblCurrent.Text = 'Paused -- click Resume to continue with the next app.'
+                $lblCurrent.ForeColor = [System.Drawing.Color]::DarkOrange
+            } elseif ($state.Index -gt 0) {
+                $lblCurrent.Text = "$($modeWord): $($state.CurrentApp)"
+                $lblCurrent.ForeColor = [System.Drawing.Color]::Black
                 $lblOverall.Text = "App $($state.Index) of $($state.Total)"
             }
 
-            if ($state.AppDone) {
+            if ($state.IsPaused) {
+                # Frozen in place, not bouncing -- an "actively working"
+                # animation would be misleading while genuinely paused.
+            } elseif ($state.AppDone) {
                 $barCurrent.Value = 100
                 $barOverall.Value = [Math]::Min($state.Index, $barOverall.Maximum)
             } else {
@@ -1317,6 +1567,12 @@ function Show-ProgressGui {
                 }
                 $barCurrent.Value = 100
                 $barOverall.Value = $barOverall.Maximum
+                # Convert Pause into Continue now that there's nothing
+                # left to pause -- clicking it goes back to a fresh
+                # selection menu (handled in this button's click handler
+                # above). Close still exits the app entirely.
+                $btnPause.Text = 'Continue'
+                $btnPause.Enabled = $true
                 $btnClose.Enabled = $true
             }
         } catch {
@@ -1350,7 +1606,7 @@ function Show-ProgressGui {
     $runspace.Close()
     $runspace.Dispose()
 
-    return $state.FinalExitCode
+    return @{ ExitCode = $state.FinalExitCode; ContinueRequested = [bool]$script:RWWContinueRequested }
 }
 
 # ---------------------------------------------------------------------------
@@ -1422,6 +1678,7 @@ if ($ResumeAfterReboot.IsPresent) {
     }
 
     Write-Log ("Resuming with: " + (($selected | ForEach-Object { $_.Name }) -join ', '))
+    $runMode = 'Install'  # only Install runs can trigger the mid-run reboot/resume cycle
 
     Write-Log "Checking network/DNS readiness before proceeding -- a freshly domain-joined machine's DNS can take a moment to fully settle right after this specific reboot."
     if (Wait-ForNetworkReadiness) {
@@ -1429,21 +1686,47 @@ if ($ResumeAfterReboot.IsPresent) {
     } else {
         Write-Log "Network/DNS still not confirmed ready after the wait -- proceeding anyway, but this may explain a network-timing-related failure if one occurs early in this run." 'WARN'
     }
+    # Resume runs skip the selection menu on their FIRST pass only --
+    # the flag below tells the run loop its first iteration already has
+    # its selection in hand. If the tech clicks Continue after the
+    # resumed run finishes, subsequent passes go through the normal
+    # selection menu like any other run.
+    $haveResumeSelection = $true
 } else {
-    $selected = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
-
-    if ($null -eq $selected) {
-        Write-Log "User quit without installing anything."
-        exit 6
-    }
-    if ($selected.Count -eq 0) {
-        Write-Log "Nothing was selected. Exiting."
-        exit 6
-    }
+    $haveResumeSelection = $false
 }
 
-$exitCode = Show-ProgressGui -Apps $selected -LogPath $LogPath -StagingDir $StagingDir `
-    -RepoOwner $RepoOwner -RepoName $RepoName -Branch $Branch -UseLocal:$Local.IsPresent -LocalRoot $script:LocalRoot `
-    -ResumeStateFile $script:ResumeStateFile -ResumeTaskName $script:ResumeTaskName -SelfScriptPath $script:SelfScriptPath
+# --- Run loop ---
+# Each pass: (selection menu unless this is the resume run's first pass)
+# -> progress window -> either exit (Close / quit) or loop back to a
+# fresh selection menu (the Continue button that replaces Pause once a
+# run finishes).
+while ($true) {
+    if (-not $haveResumeSelection) {
+        $selectionResult = Show-SelectionGui -StartBlank:$StartBlank.IsPresent
 
-exit $exitCode
+        if ($null -eq $selectionResult) {
+            Write-Log "User quit without installing anything."
+            exit 6
+        }
+        $runMode  = $selectionResult.Mode
+        $selected = $selectionResult.Apps
+        if ($selected.Count -eq 0) {
+            Write-Log "Nothing was selected. Exiting."
+            exit 6
+        }
+        Write-Log "Run mode: $runMode"
+    }
+    $haveResumeSelection = $false
+
+    $progressResult = Show-ProgressGui -Apps $selected -LogPath $LogPath -StagingDir $StagingDir `
+        -RepoOwner $RepoOwner -RepoName $RepoName -Branch $Branch -UseLocal:$Local.IsPresent -LocalRoot $script:LocalRoot `
+        -ResumeStateFile $script:ResumeStateFile -ResumeTaskName $script:ResumeTaskName -SelfScriptPath $script:SelfScriptPath `
+        -Mode $runMode
+
+    if (-not $progressResult.ContinueRequested) {
+        exit $progressResult.ExitCode
+    }
+
+    Write-Log "Continue clicked -- returning to the selection menu for another run."
+}
