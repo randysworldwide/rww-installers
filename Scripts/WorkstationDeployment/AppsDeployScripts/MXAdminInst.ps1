@@ -133,8 +133,18 @@ try {
     exit 2
 }
 
-Write-Log "Running: $localExe /S (unverified switch -- see script header)"
-$proc = Start-Process -FilePath $localExe -ArgumentList '/S' -PassThru -NoNewWindow
+# SWITCH CORRECTED based on real evidence: MXAdmin's installed
+# uninstaller is unins000.exe/unins000.dat (confirmed on a real machine
+# in Program Files (x86)\Zultys) -- the unmistakable signature of an
+# INNO SETUP package. Inno installers do NOT use /S (that's the NSIS
+# convention this script previously guessed); Inno silently ignores
+# unknown switches, shows its GUI anyway, and this script's timeout
+# would then kill it. Inno's documented silent convention is used
+# instead. Still unverified against a live MXAdmin install, but now an
+# evidence-based inference rather than a blind guess.
+$innoArgs = '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES'
+Write-Log "Running: $localExe $innoArgs (Inno Setup convention -- see comment above)"
+$proc = Start-Process -FilePath $localExe -ArgumentList $innoArgs -PassThru -NoNewWindow
 # CONFIRMED VIA A REAL FAILURE (ZAC reported FAILED with an EMPTY exit
 # code while the install actually succeeded): Start-Process -PassThru
 # WITHOUT -Wait doesn't cache the process handle, and without it,
@@ -162,7 +172,7 @@ while (-not $proc.HasExited -and $elapsedSeconds -lt $TimeoutSeconds) {
 }
 
 if (-not $proc.HasExited) {
-    Write-Log "Installer did not exit within $TimeoutSeconds seconds -- almost certainly means /S wasn't accepted and it's waiting at a GUI prompt. Killing it." 'ERROR'
+    Write-Log "Installer did not exit within $TimeoutSeconds seconds -- likely means the silent switches weren't accepted and it's waiting at a GUI prompt. Killing it." 'ERROR'
     try { $proc.Kill() } catch {}
     Write-Log "=== Install-MXAdmin finished. Overall success: False (timeout) ==="
     exit 5
