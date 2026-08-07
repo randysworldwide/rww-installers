@@ -343,6 +343,7 @@ $script:AppManifest = @(
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinAppInst.ps1' }
     @{ Name = 'ZAC Softphone';                   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ZACInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ZACUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Pulls its MSI from the private share, not GitHub. Uses the .msi, not the .exe also on the share." }
     @{ Name = 'Microsoft Visual Studio Code';    Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
@@ -447,6 +448,7 @@ $script:AppManifest = @(
        Note = "Installs the LTS line, not the latest -- safer default for business machines." }
     @{ Name = 'MXAdmin';                          Category = 'IT';            DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MXAdminInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/MXAdminUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Silent switch is an unverified guess. Has a 10-minute timeout in case it's wrong." }
 
