@@ -427,7 +427,7 @@ Write-Log "=== Install-DebloatOEM starting on $env:COMPUTERNAME ==="
 
 $targets = @(
     @{ DisplayName = 'Dell Core Services';        NamePatterns = @('Dell Core Services');       AppxSubstrings = @('CoreServices') }
-    @{ DisplayName = 'Dell Optimizer';             NamePatterns = @('Dell Optimizer*');           AppxSubstrings = @('Optimizer'); IssSharePath = '\\svazdfs001\systems$\Software\Dell\DellOptimizerUninstall.iss' }
+    @{ DisplayName = 'Dell Optimizer';             NamePatterns = @('Dell Optimizer*');           AppxSubstrings = @('Optimizer'); WingetId = 'Dell.Optimizer'; IssSharePath = '\\svazdfs001\systems$\Software\Dell\DellOptimizerUninstall.iss' }
     @{ DisplayName = 'Dell SupportAssist (and related entries)'; NamePatterns = @('Dell SupportAssist*'); AppxSubstrings = @('SupportAssist') }
     @{ DisplayName = 'Dell Trusted Device';        NamePatterns = @('Dell Trusted Device');       AppxSubstrings = @('TrustedDevice') }
     @{ DisplayName = 'Dell Watchdog Timer';        NamePatterns = @('Dell Watchdog Timer*');      AppxSubstrings = @('Watchdog') }
@@ -544,6 +544,44 @@ function Test-TargetStillPresent {
     return [bool]$registryStillThere
 }
 
+# Winget-based uninstall attempt for targets whose community manifest
+# documents the correct silent uninstall switches -- exactly the piece
+# Dell never published for Dell Optimizer's InstallShield-wrapped
+# uninstaller (two rounds of guessed switches were CONFIRMED not to
+# work; winget's manifest carries the real ones). Tried FIRST for any
+# target that declares a WingetId; the existing Appx/registry paths
+# still run afterward as usual, and the post-target verification
+# remains the ground truth either way.
+function Uninstall-ViaWinGet {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$PackageId
+    )
+
+    $wingetCmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $winget = if ($wingetCmd) { $wingetCmd.Source } else {
+        $candidate = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($candidate) { $candidate.FullName } else { $null }
+    }
+    if (-not $winget) {
+        Write-Log "winget.exe not found on this machine -- skipping the winget-based attempt for $DisplayName." 'WARN'
+        return
+    }
+
+    $wgArgs = @('uninstall', '--id', $PackageId, '-e', '--silent', '--accept-source-agreements', '--disable-interactivity')
+    Write-Log "Attempting winget-based uninstall first: winget $($wgArgs -join ' ')"
+    $proc = Start-Process -FilePath $winget -ArgumentList $wgArgs -Wait -PassThru -NoNewWindow
+    $code = $proc.ExitCode
+    if ($code -eq 0) {
+        Write-Log "winget uninstall of $PackageId completed successfully."
+    } elseif ($code -eq -1978335212) {
+        Write-Log "winget found no installed package matching $PackageId (0x8A150014) -- nothing for it to do." 'WARN'
+    } else {
+        Write-Log "winget uninstall of $PackageId did not succeed (exit $code) -- falling through to the existing removal paths." 'WARN'
+    }
+}
+
 $anyFailed = $false
 
 # REQUESTED: these two specific targets are a KNOWN, already-diagnosed
@@ -560,6 +598,10 @@ $knownAcceptedStragglers = @('Dell Optimizer', 'Dell Watchdog Timer')
 foreach ($t in $targets) {
     Write-Log "--- $($t.DisplayName) ---"
     $isAcceptedStraggler = $t.DisplayName -in $knownAcceptedStragglers
+
+    if ($t.ContainsKey('WingetId') -and $t.WingetId) {
+        Uninstall-ViaWinGet -DisplayName $t.DisplayName -PackageId $t.WingetId
+    }
 
     $appxResult = @{ Found = $false; Ok = $true }
     if ($t.AppxSubstrings.Count -gt 0) {
