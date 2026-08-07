@@ -369,6 +369,7 @@ $script:AppManifest = @(
        UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VLCUninst.ps1' }
     @{ Name = 'SentinelOne EDR';                 Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/SentinelOneInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/SentinelOneUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Pulls its MSI and site token from the private share. The token is a secret and is never logged." }
     @{ Name = 'RPS Reporting Center Shortcuts';  Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
