@@ -46,25 +46,37 @@
          there) now correctly keeps retrying on subsequent boots instead
          of silently giving up.
 
-    CONFIRMED IN TESTING -- FIRST ATTEMPT DIDN'T WORK, FIXED PROPERLY THE
-    SECOND TIME: even after the throwaway account is genuinely deleted
-    (account and profile both confirmed gone), Windows' logon screen kept
-    showing a stale tile for it, prompting for a password that can never
-    work since the account no longer exists. An earlier version of this
-    script tried fixing this by redirecting the LogonUI "last logged on
-    user" registry keys to the built-in Administrator account -- that
-    code ran successfully and reported success, but a real test showed
-    the stale tile persisted anyway. Real reports of this exact symptom
-    (found via research after the first attempt didn't hold up) point to
-    a DIFFERENT, more direct mechanism: Windows' documented way to hide a
-    specific account from the logon screen entirely, regardless of any
-    internal caching, is a DWORD value named exactly as the account (set
-    to 0) under Winlogon\SpecialAccounts\UserList. That's now the primary
-    fix; the original LastLoggedOnUser redirect is kept as a secondary,
-    harmless addition but isn't relied on alone anymore. Also added: a
-    narrowly-scoped cleanup of any stale ProfileList registry entry for
-    the removed account, another commonly-cited cause of this same
-    symptom in real reports.
+    THE LOGON-SCREEN PROBLEM -- THREE ATTEMPTS, ACTUAL ROOT CAUSES FOUND
+    ON THE THIRD: even after the throwaway account is genuinely deleted,
+    the logon screen kept suggesting it, prompting for a password that
+    can never work. Attempt 1 (redirect the LogonUI last-logged-on keys
+    to Administrator, from the post-reboot cleanup task) and attempt 2
+    (SpecialAccounts\UserList hide + ProfileList cleanup, same placement)
+    both ran without error yet the symptom persisted on real machines.
+    Re-examination found TWO real defects in those attempts:
+
+      a) A PLACEMENT race: the cleanup runs as an at-startup SYSTEM task,
+         but LogonUI.exe reads its last-logged-on values very early in
+         boot -- evidently before the task's writes land. The registry
+         ended up correct but too late for the screen being shown. The
+         fix now runs in THIS script, pre-reboot, while still logged in
+         as the throwaway account -- so LogonUI reads the right values
+         the first time it looks.
+
+      b) A VALUE-TYPE bug: LastLoggedOnUserSID is a REG_SZ STRING in the
+         LogonUI key; attempt 1 wrote it as BINARY SID bytes -- a wrong
+         type that plausibly made LogonUI ignore the whole value set.
+         LastLoggedOnDisplayName was also never set. Both corrected.
+
+    Current design: pre-reboot, this script (1) points all four LogonUI
+    last-logged-on values at the built-in Administrator (correct types),
+    and (2) hides the throwaway account from the tile list via
+    SpecialAccounts\UserList -- so even if winlogon overwrites the
+    last-logged-on values during the throwaway session's own shutdown
+    (an acknowledged unknown), the deleted account still can't be the
+    suggested login. The post-reboot cleanup task re-asserts the same
+    values as a backup pass, plus the narrowly-scoped stale-ProfileList
+    cleanup from attempt 2 (still worthwhile on its own).
 
     Steps this script performs NOW (pre-reboot):
       1. Determine the target account -- defaults to whichever account is
@@ -177,6 +189,60 @@ try {
     Write-Log "Could not check/disable AutoAdminLogon: $($_.Exception.Message)" 'WARN'
 }
 
+# --- Point the logon screen at Administrator NOW, before the reboot. ---
+# WHY HERE AND NOT IN THE CLEANUP TASK (the root cause of two previous
+# failed attempts at this): the post-reboot cleanup runs as an
+# at-startup SYSTEM task, which RACES LogonUI.exe -- and LogonUI reads
+# its "last logged on" values very early in boot, evidently before the
+# task's registry writes land. The values ended up correct in the
+# registry but too late for the screen being displayed. Writing them
+# HERE, while still logged in as the throwaway account BEFORE the
+# reboot, means LogonUI reads the right values the first time it ever
+# looks.
+#
+# ALSO FIXING A REAL BUG from the earlier attempt: LastLoggedOnUserSID
+# is a REG_SZ STRING value ("S-1-5-21-...") in the LogonUI key -- the
+# earlier code wrote it as BINARY SID bytes, a wrong type that plausibly
+# made LogonUI ignore the whole value set. LastLoggedOnDisplayName was
+# also never set before. Correct layout, all REG_SZ:
+#   LastLoggedOnUser        = .\<name>   (dot-qualified for local)
+#   LastLoggedOnSAMUser     = <MACHINE>\<name>
+#   LastLoggedOnUserSID     = <SID string>
+#   LastLoggedOnDisplayName = <name>
+try {
+    $adminAccount = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1
+    if ($adminAccount) {
+        $logonUiKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI'
+        Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUser'        -Value ".\$($adminAccount.Name)" -Type String -ErrorAction Stop
+        Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnSAMUser'     -Value "$env:COMPUTERNAME\$($adminAccount.Name)" -Type String -ErrorAction Stop
+        Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUserSID'     -Value $adminAccount.SID.Value -Type String -ErrorAction Stop
+        Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnDisplayName' -Value $adminAccount.Name -Type String -ErrorAction Stop
+        Write-Log "Pointed the logon screen's 'last logged on' slot at '$($adminAccount.Name)' (pre-reboot, so LogonUI reads it correctly at next boot instead of racing the cleanup task)."
+    } else {
+        Write-Log "Could not find the built-in Administrator account (SID -500) -- skipping the logon-screen redirect." 'WARN'
+    }
+} catch {
+    Write-Log "Could not update the logon screen's last-logged-on values (non-fatal): $($_.Exception.Message)" 'WARN'
+}
+
+# --- Hide the throwaway account from the logon tile list, also NOW. ---
+# SpecialAccounts\UserList (DWORD 0 named as the account) is Windows'
+# documented mechanism for keeping a specific account off the logon
+# screen entirely. Applied pre-reboot for the same race-avoidance reason
+# as above. The account still EXISTS until the cleanup task removes it
+# post-reboot, but it stops being offered as a sign-in option
+# immediately -- so even if something overwrites the last-logged-on
+# values above during shutdown, the deleted account can't be the
+# suggested login.
+try {
+    $specialAccountsKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
+    if (-not (Test-Path $specialAccountsKey)) { New-Item -Path $specialAccountsKey -Force | Out-Null }
+    Set-ItemProperty -Path $specialAccountsKey -Name $TargetAccount -Value 0 -Type DWord -ErrorAction Stop
+    Write-Log "Hid '$TargetAccount' from the logon screen tile list (SpecialAccounts\UserList), effective from the next boot."
+} catch {
+    Write-Log "Could not hide '$TargetAccount' from the logon tile list (non-fatal): $($_.Exception.Message)" 'WARN'
+}
+
 $localUser   = Get-LocalUser -Name $TargetAccount -ErrorAction SilentlyContinue
 $folderPath  = "C:\Users\$TargetAccount"
 $folderExists = Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue
@@ -274,29 +340,25 @@ if ($accountRemoved) {
     }
 }
 
-# BEST EFFORT, NOT VERIFIED LIVE -- unlike the SpecialAccounts\UserList
-# fix above (which is Windows' own documented mechanism), this specific
-# approach (redirecting LastLoggedOnUser to Administrator) was tried once
-# already and did NOT resolve the stale-tile symptom on its own. Left in
-# place since it's harmless and may still help pick which tile is
-# pre-selected once the SpecialAccounts fix actually removes the stale
-# one from the list, but it should not be relied on as the primary fix.
+# BACKUP PASS: the main script now writes these same values PRE-reboot
+# (see its logon-screen section for why that placement matters -- this
+# at-startup task races LogonUI and can land too late for the first
+# boot's screen). Re-asserting them here is a safety net for the case
+# where winlogon overwrote the last-logged-on values during the shutdown
+# of the throwaway session -- correct from the SECOND boot onward even
+# in that case. NOTE: an earlier version wrote LastLoggedOnUserSID as
+# binary bytes; it is a REG_SZ STRING in this key -- fixed, along with
+# adding the previously-missing LastLoggedOnDisplayName.
 if ($accountRemoved) {
     try {
         $adminAccount = Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { $_.SID -like '*-500' } | Select-Object -First 1
         if ($adminAccount) {
-            $logonUiKey   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI'
-            $samQualified = "$env:COMPUTERNAME\$($adminAccount.Name)"
-
-            $sid      = New-Object System.Security.Principal.SecurityIdentifier($adminAccount.SID.Value)
-            $sidBytes = New-Object byte[] ($sid.BinaryLength)
-            $sid.GetBinaryForm($sidBytes, 0)
-
-            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUser' -Value $samQualified -Type String -ErrorAction Stop
-            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnSAMUser' -Value $samQualified -Type String -ErrorAction Stop
-            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUserSID' -Value $sidBytes -Type Binary -ErrorAction Stop
-
-            Write-CleanupLog "Updated the logon screen's default user to '$($adminAccount.Name)' so it stops defaulting to the now-deleted $TargetAccount account."
+            $logonUiKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI'
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUser'        -Value ".\$($adminAccount.Name)" -Type String -ErrorAction Stop
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnSAMUser'     -Value "$env:COMPUTERNAME\$($adminAccount.Name)" -Type String -ErrorAction Stop
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnUserSID'     -Value $adminAccount.SID.Value -Type String -ErrorAction Stop
+            Set-ItemProperty -Path $logonUiKey -Name 'LastLoggedOnDisplayName' -Value $adminAccount.Name -Type String -ErrorAction Stop
+            Write-CleanupLog "Re-asserted the logon screen's last-logged-on values to '$($adminAccount.Name)' (backup pass -- the main script already set these pre-reboot)."
         } else {
             Write-CleanupLog "Could not find the built-in Administrator account (SID -500) to point the logon screen at -- skipping this step." 'WARN'
         }
