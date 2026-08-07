@@ -1295,7 +1295,18 @@ function Show-ProgressGui {
                                 -Argument "-NoProfile -STA -ExecutionPolicy Bypass -File `"$SelfScriptPath`" -ResumeAfterReboot"
                             $resumeTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
                             $resumePrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
-                            $resumeSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                            # -Priority 4 = NORMAL process priority. Without
+                            # this, Task Scheduler launches the resumed
+                            # process at BELOW NORMAL (priority 7, the
+                            # default) -- and a below-normal GUI whose
+                            # message pump competes against CPU-heavy
+                            # install work (msiexec's service, DISM,
+                            # winget) gets starved into a completely
+                            # unresponsive window while the background
+                            # worker keeps going fine. Matches a real,
+                            # repeatedly-observed freeze that ONLY
+                            # occurred in resumed sessions.
+                            $resumeSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Priority 4
 
                             Register-ScheduledTask -TaskName $ResumeTaskName -Action $resumeAction -Trigger $resumeTrigger `
                                 -Principal $resumePrincipal -Settings $resumeSettings -Force -ErrorAction Stop | Out-Null
@@ -1616,6 +1627,23 @@ Write-Log "=== Apps-Deploy-Menu starting on $env:COMPUTERNAME ==="
 
 if ($ResumeAfterReboot.IsPresent) {
     Write-Log "Resuming a deployment run interrupted by a mid-run reboot (Change Computer Name + Join Domain)."
+
+    # Self-normalize process priority FIRST. This session was launched by
+    # a Scheduled Task, and Task Scheduler starts processes at BELOW
+    # NORMAL priority by default -- which starves this GUI's message pump
+    # into a frozen, fully-unresponsive window the moment CPU-heavy
+    # install work begins, while the background worker keeps running fine
+    # (a real, repeatedly-observed symptom exclusive to resumed
+    # sessions). The task registration also requests normal priority now
+    # (-Priority 4), but self-normalizing here covers a resume task
+    # registered by an OLDER version of this script, plus any other
+    # low-priority launch context.
+    try {
+        (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
+        Write-Log "Process priority normalized to Normal (Task Scheduler launches at Below Normal by default)."
+    } catch {
+        Write-Log "Could not adjust process priority (non-fatal): $($_.Exception.Message)" 'WARN'
+    }
 
     # Close the one-time auto-login window immediately -- it was enabled
     # for exactly this one reboot cycle (see the worker script's
