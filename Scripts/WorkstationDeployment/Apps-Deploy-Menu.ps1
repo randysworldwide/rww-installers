@@ -340,7 +340,8 @@ $script:AppManifest = @(
        NeedsShareCredentials = $true
        Note = "Pulls from the private network share, not GitHub -- won't work on a machine with no network access yet." }
     @{ Name = 'Windows App (RDP)';               Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
-       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinAppInst.ps1' }
+       InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinAppInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinAppUninst.ps1' }
     @{ Name = 'ZAC Softphone';                   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ZACInst.ps1'
        UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ZACUninst.ps1'
@@ -354,6 +355,7 @@ $script:AppManifest = @(
        UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/WinTerminalUninst.ps1' }
     @{ Name = 'Cisco Secure Client';             Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CiscoSecureClientInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/CiscoSecureClientUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Runs a pre-built installer bundle from the private share -- handles the VPN profile and retries internally." }
     @{ Name = 'Microsoft .NET Desktop Runtime 8';   Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
@@ -407,7 +409,9 @@ $script:AppManifest = @(
        UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/GChromeUninst.ps1' }
     @{ Name = 'Microsoft Outlook Classic';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OutlookClassicInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/OutlookClassicUninst.ps1'
        NeedsShareCredentials = $true
+       UninstallNeedsShareCredentials = $true
        Note = "Silent by design, but unverified -- has a timeout safety net just in case." }
     @{ Name = 'Logi Options+';                    Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/LogiOptInst.ps1'
