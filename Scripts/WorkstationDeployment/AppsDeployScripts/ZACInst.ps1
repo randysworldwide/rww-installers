@@ -1,88 +1,38 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Installs Zultys ZAC (softphone) by running the original InstallShield
-    bootstrapper EXE locally, rather than driving ZAC.msi directly.
-    Designed to run elevated on a single box (RWW WorkstationDeployment
-    project -- see Apps-Deploy-Menu.ps1).
+    Uninstalls Zultys ZAC (softphone) via winget. Designed to run elevated on a
+    single box (RWW WorkstationDeployment project -- see
+    Apps-Deploy-Menu.ps1, Uninstall mode).
 
 .DESCRIPTION
     Repo: randysworldwide/rww-installers
-    Path: Scripts/WorkstationDeployment/AppsDeployScripts/ZACInst.ps1
+    Path: Scripts/WorkstationDeployment/AppsDeployScripts/ZACUninst.ps1
 
-    Source folder (on the private share; not hosted in this public repo):
+    Counterpart to ZACInst.ps1 -- same winget package ID(s), inverse
+    operation. Part of the Uninstall mode added to Apps-Deploy-Menu.ps1:
+    only apps with a dedicated, safe uninstall script get one of these;
+    apps whose removal is risky or needs extra inputs (e.g. SentinelOne's
+    passphrase, Office's ODT flow) deliberately don't have one yet and
+    show as unavailable in Uninstall mode instead of guessing at a
+    destructive operation.
 
-        \\svazdfs001\systems$\Software\Zultys\ZAC\ZAC_x64-10.0.10\
-        (falls back to \\10.1.0.5\... if the hostname doesn't resolve)
-
-    Only needs two files there now: ZAC.msi and ZAC_x64-10.0.10.exe.
-
-    WHY THIS APPROACH, AFTER SIX ROUNDS OF A DIFFERENT ONE: ZAC.msi is a
-    "compressed MSI" that also needs files stored UNCOMPRESSED alongside
-    it (an administrative-install source layout). An earlier version of
-    this script tried to reconstruct that layout on the share -- first by
-    staging a few specific known files, then by mirroring the entire
-    source tree into a nested "program files\Zultys\ZAC\" folder. Six
-    separate real msiexec 1308/1309 errors later (register_x64.vbs,
-    check_vc_x64.vbs, PlantronicsDevices.xml, qt.conf, zac.ico, and
-    finally a QtWebEngine locale file, translations\qtwebengine_locales\
-    en-GB.pak), it became clear the ROOT problem wasn't fixable by
-    copying more cleverly: the share was populated from an
-    ALREADY-INSTALLED machine's ZAC folder, and installed copies of
-    Qt/Chromium-based apps commonly only RETAIN the locale files actually
-    in use, not the complete original set -- en-GB.pak was never present
-    anywhere we had access to, no matter how the copy was structured.
-
-    FIXED by sidestepping the whole problem: rather than reconstruct an
-    administrative-install layout by hand, this runs the original
-    Zultys-provided bootstrapper (ZAC_x64-10.0.10.exe) directly. That EXE
-    is confirmed to be an InstallShield-generated setup (the install
-    wizard's own title bar reads "ZAC - InstallShield Wizard"), and it
-    embeds the COMPLETE original package -- every locale file included --
-    since it's the pristine vendor deliverable, not a reconstructed copy.
-    It extracts its own payload internally and drives its own msiexec
-    call, so there's no longer any need to know or maintain a list of
-    which sibling files ZAC.msi expects.
-
-    Uses InstallShield's own standard, documented silent-install
-    convention for a generic bootstrapper: /s (silent) /v"..." (pass
-    arguments through to the wrapped msiexec call). This is InstallShield's
-    OWN generic convention, not a vendor-specific guess the way Dell's
-    various custom wrapper switches turned out to be -- meaningfully
-    higher confidence than most "guessed switch" situations elsewhere in
-    this project, but still not something that's been confirmed against
-    this SPECIFIC bootstrapper in a live test, so flagging that honestly.
-    A bounded timeout guards against the case where the switches don't
-    achieve full silence and a wizard window ends up waiting for input
-    that will never come -- without a timeout, that would hang the whole
-    deployment run indefinitely instead of failing cleanly.
-
-.PARAMETER LogPath
-    Where to write this script's own log file.
+    winget exit code 0x8A150014 (-1978335212, NO_APPLICATIONS_FOUND) is
+    treated as "not installed -- nothing to do" (exit 4), not a failure.
 
 .EXITCODES
-    0 = success -- ZAC was actually installed this run
-    1 = the installer reported failure, or timed out (see the log for which)
-    2 = could not reach ZAC.msi/ZAC_x64-10.0.10.exe on the network share
+    0 = success -- Zultys ZAC (softphone) was actually uninstalled this run
+    1 = uninstall failed
     3 = not running elevated
-    4 = nothing to do -- ZAC was already installed
+    4 = nothing to do -- Zultys ZAC (softphone) was not installed
 #>
 
 [CmdletBinding()]
 param(
-    [string]$LogPath = "$env:ProgramData\Dev\AppsDeploy\Logs\ZACInst.log"
+    [string]$LogPath = "$env:ProgramData\Dev\AppsDeploy\Logs\ZACUninst.log"
 )
 
 $ErrorActionPreference = 'Stop'
-
-$StageDir      = "$env:ProgramData\Dev\AppsDeploy\ZACSoftphone"
-$SharePaths    = @(
-    '\\svazdfs001\systems$\Software\Zultys\ZAC\ZAC_x64-10.0.10',
-    '\\10.1.0.5\systems$\Software\Zultys\ZAC\ZAC_x64-10.0.10'
-)
-$MsiFileName   = 'ZAC.msi'
-$ExeFileName   = 'ZAC_x64-10.0.10.exe'
-$InstallTimeoutSeconds = 600   # 10 minutes -- generous but bounded, see header
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -110,160 +60,129 @@ if (-not (Test-IsElevated)) {
     exit 3
 }
 
-function Test-ZACInstalled {
+function Resolve-WinGetPath {
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = Get-ChildItem "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if ($candidates) { return $candidates.FullName }
+    return $null
+}
+
+# CONFIRMED VIA A REAL INCIDENT (7-Zip uninstall, Event Viewer
+# RestartManager events 10010 + 10006): apps with shell extensions
+# (context-menu handlers etc.) have DLLs loaded inside explorer.exe.
+# A silent MSI uninstall's Restart Manager step can decide it must shut
+# down Explorer to release that in-use DLL -- and then FAIL to restart
+# it ("Application SID does not match Conductor SID" from the elevated
+# session), leaving the tech staring at a black desktop with no taskbar
+# until they manually restart explorer.exe via Task Manager. This
+# watchdog runs right after each uninstall command: if Explorer is gone,
+# relaunch it immediately, bounding the black-screen window to seconds
+# instead of requiring manual recovery.
+function Restore-ExplorerIfKilled {
+    $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue
+    if (-not $explorer) {
+        Write-Log "explorer.exe is not running -- an uninstaller's Restart Manager step likely shut it down and failed to restart it (a confirmed real behavior for apps with shell extensions). Relaunching it." 'WARN'
+        try {
+            Start-Process 'explorer.exe'
+        } catch {
+            Write-Log "Failed to relaunch explorer.exe: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+Write-Log "=== Uninstall-ZAC starting on $env:COMPUTERNAME ==="
+
+$winget = Resolve-WinGetPath
+if (-not $winget) {
+    Write-Log "Could not locate winget.exe on this machine." 'ERROR'
+    exit 1
+}
+Write-Log "Using winget at: $winget"
+
+$NotFoundCode = -1978335212  # 0x8A150014 NO_APPLICATIONS_FOUND
+$packageIds = @('Zultys.ZAC')
+
+# A softphone is exactly the kind of thing likely to be RUNNING at
+# uninstall time -- stop it first so a files-in-use condition can't
+# stall or break the silent removal.
+foreach ($procName in @('zac', 'ZultysCrashHandler')) {
+    $running = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Log "Stopping running process '$procName' so it can't block the uninstall." 'WARN'
+        try { $running | Stop-Process -Force -ErrorAction Stop } catch {
+            Write-Log "Could not stop '$procName' (continuing anyway): $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+$anyRemoved = $false
+$anyFailed  = $false
+$allMissing = $true
+
+foreach ($id in $packageIds) {
+    $args = @('uninstall', '--id', $id, '-e', '--silent', '--accept-source-agreements', '--disable-interactivity')
+    Write-Log "Running: winget $($args -join ' ')"
+    $proc = Start-Process -FilePath $winget -ArgumentList $args -Wait -PassThru -NoNewWindow
+    $code = $proc.ExitCode
+    Write-Log "winget exit code: $code"
+
+    Restore-ExplorerIfKilled
+
+    if ($code -eq 0) {
+        $anyRemoved = $true
+        $allMissing = $false
+        Write-Log "Uninstalled $id successfully."
+    } elseif ($code -eq $NotFoundCode) {
+        Write-Log "$id was not installed -- nothing to do for this ID." 'WARN'
+    } else {
+        $anyFailed  = $true
+        $allMissing = $false
+        Write-Log "Uninstall of $id FAILED (winget exit $code)." 'ERROR'
+    }
+}
+
+# FALLBACK: ZAC on existing machines was installed via its InstallShield
+# /MSI bootstrapper, not via winget -- winget uninstall normally still
+# correlates it through the Programs & Features entry, but if that
+# correlation misses (e.g. an installed version outside the manifest's
+# known range), fall back to the MSI product code from ZAC's own
+# registry entry directly. MSIRESTARTMANAGERCONTROL=Disable prevents the
+# Restart Manager explorer-kill behavior on this path (see the
+# watchdog's comment above).
+if ($anyFailed -or $allMissing) {
     $hives = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
+    $entry = $null
     foreach ($hive in $hives) {
-        $match = Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like '*ZAC*' }
-        if ($match) { return $true }
+        $entry = Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*ZAC*' -and $_.UninstallString } |
+            Select-Object -First 1
+        if ($entry) { break }
     }
-    return $false
+    if ($entry -and $entry.UninstallString -match '\{[0-9A-Fa-f\-]+\}') {
+        $productCode = $Matches[0]
+        Write-Log "winget path didn't remove it -- falling back to direct MSI uninstall of product code $productCode"
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/x $productCode /qn /norestart MSIRESTARTMANAGERCONTROL=Disable" -Wait -PassThru -NoNewWindow
+        Write-Log "msiexec exit code: $($proc.ExitCode)"
+        Restore-ExplorerIfKilled
+        if ($proc.ExitCode -in @(0, 3010, 1641)) {
+            $anyFailed = $false; $anyRemoved = $true; $allMissing = $false
+        }
+    }
 }
 
-Write-Log "=== Install-ZAC starting on $env:COMPUTERNAME ==="
-
-if (Test-ZACInstalled) {
-    Write-Log "ZAC already installed. Skipping."
-    Write-Log "Nothing was installed -- ZAC was already present." 'WARN'
+if ($anyFailed) {
+    Write-Log "=== Uninstall-ZAC finished. Overall success: False ==="
+    exit 1
+} elseif ($allMissing) {
+    Write-Log "Nothing was uninstalled -- Zultys ZAC (softphone) was not installed." 'WARN'
+    Write-Log "=== Uninstall-ZAC finished. Nothing to do. ==="
     exit 4
-}
-
-$sourceDir = $null
-foreach ($candidate in $SharePaths) {
-    $msiCandidate = Join-Path $candidate $MsiFileName
-    $exeCandidate = Join-Path $candidate $ExeFileName
-    Write-Log "Checking share path: $candidate"
-    if ((Test-Path $msiCandidate -ErrorAction SilentlyContinue) -and (Test-Path $exeCandidate -ErrorAction SilentlyContinue)) {
-        $sourceDir = $candidate
-        Write-Log "Found both ZAC.msi and $ExeFileName at: $candidate"
-        break
-    }
-}
-
-if (-not $sourceDir) {
-    Write-Log "Could not reach ZAC.msi and $ExeFileName together on any known share path. Checked: $($SharePaths -join ', ')" 'ERROR'
-    exit 2
-}
-
-try {
-    if (-not (Test-Path $StageDir)) { New-Item -Path $StageDir -ItemType Directory -Force | Out-Null }
-    $localMsi = Join-Path $StageDir $MsiFileName
-    $localExe = Join-Path $StageDir $ExeFileName
-    Write-Log "Staging both files to $StageDir"
-    Copy-Item -LiteralPath (Join-Path $sourceDir $MsiFileName) -Destination $localMsi -Force -ErrorAction Stop
-    Copy-Item -LiteralPath (Join-Path $sourceDir $ExeFileName) -Destination $localExe -Force -ErrorAction Stop
-} catch {
-    Write-Log "Failed to copy install files from $sourceDir : $($_.Exception.Message)" 'ERROR'
-    exit 2
-}
-
-# InstallShield's standard generic-bootstrapper silent convention: /s
-# (silent) /v"..." (pass everything in quotes through to the wrapped
-# msiexec call). REBOOT=ReallySuppress and /norestart mirror the same
-# no-surprise-reboot behavior used by every other MSI-based install in
-# this project.
-$exeArgs = '/s /v"/qn REBOOT=ReallySuppress /norestart"'
-Write-Log "Running: $localExe $exeArgs (timeout ${InstallTimeoutSeconds}s)"
-
-# CONCRETE STRUCTURAL DIFFERENCE, FOUND VIA COMPARISON: this used to use
-# -WindowStyle Hidden, which is the ONLY thing that was actually different
-# between this script and the three others with a similar timeout-guarded
-# Start-Process call (CiscoSecureClientInst.ps1, MXAdminInst.ps1,
-# OutlookClassicInst.ps1) -- all three of THOSE use -NoNewWindow instead,
-# and none of them exhibited this freeze. -WindowStyle Hidden (without
-# -NoNewWindow) makes Start-Process use ShellExecuteEx internally -- a
-# COM-based, shell-level API with its own STA threading and message-
-# pumping requirements during the launch itself, not just while waiting
-# afterward. -NoNewWindow instead uses CreateProcess directly, with no
-# COM/shell involvement at all. Switched to match the other three scripts
-# exactly, removing this COM-based code path as a possible contributor to
-# a real, confirmed freeze that happens specifically at this exact point.
-$proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -PassThru -NoNewWindow
-# CONFIRMED VIA A REAL FAILURE (ZAC reported FAILED with an EMPTY exit
-# code while the install actually succeeded): Start-Process -PassThru
-# WITHOUT -Wait doesn't cache the process handle, and without it,
-# .ExitCode can come back $null once the process has exited -- a known
-# PowerShell gotcha. The old blocking WaitForExit() call implicitly
-# initialized the handle; the polling-loop replacement (the freeze fix)
-# removed that side effect. Touching .Handle immediately after launch is
-# the canonical fix -- it forces the handle to be cached while the
-# process is guaranteed to still exist.
-$null = $proc.Handle
-
-# CONFIRMED IN TESTING: this used to call $proc.WaitForExit(ms) directly
-# -- a blocking .NET call. This is the ONLY script in the whole project
-# that waited this way instead of Start-Process's own -Wait switch
-# (used everywhere else), and it's the one that caused a real, confirmed
-# GUI freeze: the background worker kept executing fine underneath
-# (confirmed via the log -- everything after ZAC kept installing
-# normally), but the main progress window's own display froze solid,
-# only at the point ZAC ran. Root cause: calling raw
-# Process.WaitForExit() from an STA thread (the background runspace is
-# correctly STA, per an earlier fix) is a well-documented source of
-# exactly this symptom if the launched process creates ANY window --
-# even a hidden one, which -WindowStyle Hidden still does -- and that
-# window communicates back to the parent via window messages.
-# WaitForExit() can starve the calling thread's own message pump while
-# blocking, freezing that thread's responsiveness even though the actual
-# wait itself completes normally. ZAC's InstallShield bootstrapper is
-# exactly the kind of GUI-capable process that does this internally even
-# when run silently. Fixed by polling instead of blocking -- Start-Sleep
-# doesn't carry the same message-pump requirement that
-# Process.WaitForExit() does on an STA thread.
-$elapsedSeconds = 0
-$pollIntervalSeconds = 2
-while (-not $proc.HasExited -and $elapsedSeconds -lt $InstallTimeoutSeconds) {
-    Start-Sleep -Seconds $pollIntervalSeconds
-    $elapsedSeconds += $pollIntervalSeconds
-}
-
-if (-not $proc.HasExited) {
-    Write-Log "Installer did not finish within ${InstallTimeoutSeconds}s -- likely means the silent switches didn't achieve full silence and a wizard window is waiting for input that will never come. Killing it rather than hanging the whole deployment run." 'ERROR'
-    try { $proc.Kill() } catch {}
-    Write-Log "=== Install-ZAC finished. Overall success: False ==="
-    exit 1
-}
-
-$exitCode = $proc.ExitCode
-Write-Log "Installer exit code: $exitCode"
-
-# Defensive fallback for the same null-ExitCode gotcha the .Handle fix
-# above addresses: if the exit code STILL can't be read for some reason,
-# don't fail a possibly-successful install over an unreadable number --
-# fall through to the registry detection below, which is the actual
-# ground truth for whether ZAC ended up installed.
-if ($null -eq $exitCode) {
-    Write-Log "Exit code could not be read from the installer process -- falling back to registry detection as the ground truth instead of treating the unreadable code as a failure." 'WARN'
-    if (Test-ZACInstalled) {
-        Write-Log "ZAC confirmed present via registry."
-        Write-Log "=== Install-ZAC finished. Overall success: True (exit code unreadable, verified via registry) ==="
-        exit 0
-    } else {
-        Write-Log "ZAC not found in the registry either -- treating as a failure." 'ERROR'
-        Write-Log "=== Install-ZAC finished. Overall success: False ==="
-        exit 1
-    }
-}
-
-if ($exitCode -notin @(0, 3010, 1641)) {
-    Write-Log "Install FAILED (exit code $exitCode)." 'ERROR'
-    Write-Log "=== Install-ZAC finished. Overall success: False ==="
-    exit 1
-}
-
-if ($exitCode -in @(3010, 1641)) {
-    Write-Log "Install succeeded; a reboot is required to complete." 'WARN'
-}
-
-if (Test-ZACInstalled) {
-    Write-Log "ZAC confirmed present after install."
-    Write-Log "=== Install-ZAC finished. Overall success: True ==="
-    exit 0
 } else {
-    Write-Log "Installer reported success but no matching ZAC entry was found in the registry afterward." 'ERROR'
-    Write-Log "=== Install-ZAC finished. Overall success: False ==="
-    exit 1
+    Write-Log "=== Uninstall-ZAC finished. Overall success: True ==="
+    exit 0
 }
