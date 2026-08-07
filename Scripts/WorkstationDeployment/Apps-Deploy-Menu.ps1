@@ -373,6 +373,7 @@ $script:AppManifest = @(
        Note = "Pulls its MSI and site token from the private share. The token is a secret and is never logged." }
     @{ Name = 'RPS Reporting Center Shortcuts';  Category = 'Initial Setup'; DefaultOn = $true;  Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ReportingCenterInst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ReportingCenterUninst.ps1'
        NeedsShareCredentials = $true
        Note = "Not a software install -- copies two RDP shortcuts to the Public desktop, visible to all users. Skips if both already exist." }
 
@@ -420,11 +421,15 @@ $script:AppManifest = @(
        Note = "Installs per-user, not machine-wide -- run as the actual end user, not a technician's own account." }
     @{ Name = 'Project Professional 2021';        Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ProjectPro2021Inst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/ProjectPro2021Uninst.ps1'
        NeedsShareCredentials = $true
+       UninstallNeedsShareCredentials = $true
        Note = "Standalone install via ODT. Compatible alongside Office O365 or Office 2021, no conflict." }
     @{ Name = 'Visio LTSC Professional 2021';     Category = 'Optional';      DefaultOn = $false; Status = 'Ready';
        InstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VisioPro2021Inst.ps1'
+       UninstallRepoPath = 'Scripts/WorkstationDeployment/AppsDeployScripts/VisioPro2021Uninst.ps1'
        NeedsShareCredentials = $true
+       UninstallNeedsShareCredentials = $true
        Note = "Standalone install via ODT. Compatible alongside Office O365 or Office 2021, no conflict." }
 
     # --- IT ---
