@@ -919,6 +919,7 @@ function Show-ProgressGui {
         FinalExitCode  = 0
         PauseRequested = $false
         IsPaused       = $false
+        RebootPending  = $false
     })
 
     # --- Background runspace that does the actual installing ---
@@ -1360,6 +1361,13 @@ function Show-ProgressGui {
                         }
 
                         Write-WorkerLog "Restarting in 20 seconds..." 'WARN'
+                        # Set BEFORE AllDone: the GUI timer reads AllDone and
+                        # decides what the buttons do -- for a pending reboot
+                        # they must ALL grey out (no Continue, no Cancel, no
+                        # Close), so a tech can't mistake the wait for
+                        # something needing a click. The machine restarts
+                        # itself; the run resumes automatically after logon.
+                        $StateRef.RebootPending = $true
                         $StateRef.FinalExitCode = 0
                         $StateRef.AllDone = $true
                         Start-Sleep -Seconds 20
@@ -1433,15 +1441,32 @@ function Show-ProgressGui {
         $form.TopMost = $false
     })
 
-    # Alt+F4 is intentionally left enabled (no FormClosing cancellation) --
-    # technicians running this need a way to force-kill a stuck/hung run.
-    # ControlBox stays $false (no visible titlebar close/min/max buttons,
-    # "Close" is its own button below, disabled until installs finish) but
-    # Alt+F4 still works as a normal OS-level accelerator regardless of
-    # ControlBox. Closing mid-install orphans the background runspace, but
-    # the cleanup code after ShowDialog() below already handles that --
-    # $ps.Stop() runs if the runspace hasn't finished when the form closes
-    # for any reason, Alt+F4 included.
+    # Alt+F4 is intentionally left enabled (no blanket FormClosing
+    # cancellation) -- technicians running this need a way to force-kill a
+    # stuck/hung run. ControlBox stays $false (no visible titlebar
+    # close/min/max buttons, "Close" is its own button below, disabled
+    # until installs finish) but Alt+F4 still works as a normal OS-level
+    # accelerator regardless of ControlBox. Closing mid-install orphans
+    # the background runspace, but the cleanup code after ShowDialog()
+    # below already handles that -- $ps.Stop() runs if the runspace
+    # hasn't finished when the form closes for any reason, Alt+F4
+    # included.
+    #
+    # ONE deliberate exception: while a mid-run reboot is pending (the
+    # ~20-second window after Join Domain succeeds, before
+    # Restart-Computer fires), closing the form is BLOCKED. Cleanup's
+    # $ps.Stop() would abort the worker's pre-reboot sleep -- meaning the
+    # machine never restarts, while the resume scheduled task and the
+    # one-time auto-login registry values are ALREADY armed for a reboot
+    # that then never happens. That half-armed state is exactly the kind
+    # of stray variable the greyed-out buttons in this window exist to
+    # prevent, so the escape hatch closes for those ~20 seconds too.
+    $form.Add_FormClosing({
+        param($formSender, $closeArgs)
+        if ($state.RebootPending) {
+            $closeArgs.Cancel = $true
+        }
+    })
 
     $lblCurrent = New-Object System.Windows.Forms.Label
     $lblCurrent.Location = New-Object System.Drawing.Point(15, 15)
@@ -1619,22 +1644,38 @@ function Show-ProgressGui {
 
             if ($state.AllDone) {
                 $timer.Stop()
-                if ($state.FinalExitCode -eq 0) {
-                    $lblCurrent.Text = 'All selected apps finished successfully.'
-                } else {
-                    $lblCurrent.Text = 'Finished with one or more failures -- see log above.'
-                    $lblCurrent.ForeColor = [System.Drawing.Color]::Firebrick
-                }
                 $barCurrent.Value = 100
                 $barOverall.Value = $barOverall.Maximum
-                # Convert Pause into Continue now that there's nothing
-                # left to pause -- clicking it goes back to a fresh
-                # selection menu (handled in this button's click handler
-                # above). Close still exits the app entirely.
-                $btnPause.Text = 'Continue'
-                $btnPause.Enabled = $true
-                $btnCancelStep.Enabled = $false
-                $btnClose.Enabled = $true
+
+                if ($state.RebootPending) {
+                    # Mid-run reboot (Change Computer Name + Join Domain):
+                    # the machine restarts ITSELF in ~20 seconds and the
+                    # run resumes automatically after logon. Grey out
+                    # every button so nothing here looks like it needs
+                    # (or even accepts) a click -- a tech reaching for
+                    # Continue/Close during this window would only be
+                    # introducing variables into an automatic handoff.
+                    $lblCurrent.Text = 'Restarting in ~20 seconds to complete the rename/domain join -- no action needed. The run resumes automatically after logon.'
+                    $lblCurrent.ForeColor = [System.Drawing.Color]::DarkOrange
+                    $btnPause.Enabled = $false
+                    $btnCancelStep.Enabled = $false
+                    $btnClose.Enabled = $false
+                } else {
+                    if ($state.FinalExitCode -eq 0) {
+                        $lblCurrent.Text = 'All selected apps finished successfully.'
+                    } else {
+                        $lblCurrent.Text = 'Finished with one or more failures -- see log above.'
+                        $lblCurrent.ForeColor = [System.Drawing.Color]::Firebrick
+                    }
+                    # Convert Pause into Continue now that there's nothing
+                    # left to pause -- clicking it goes back to a fresh
+                    # selection menu (handled in this button's click handler
+                    # above). Close still exits the app entirely.
+                    $btnPause.Text = 'Continue'
+                    $btnPause.Enabled = $true
+                    $btnCancelStep.Enabled = $false
+                    $btnClose.Enabled = $true
+                }
             }
         } catch {
             # Defensive only -- an unhandled exception here could
