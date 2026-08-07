@@ -1494,9 +1494,46 @@ function Show-ProgressGui {
     $txtLog.ForeColor = [System.Drawing.Color]::LightGray
     $form.Controls.Add($txtLog)
 
+    # Cancel sits between Pause and Close. Its job: abort the CURRENTLY
+    # RUNNING app step when it's clearly stuck (e.g. a verification poll
+    # that will never succeed), and go back to the selection menu --
+    # instead of the only escape hatch being Alt+F4 on the whole app.
+    # Mechanically it just closes the form with the Continue signal set:
+    # the existing post-ShowDialog cleanup already calls $ps.Stop() on a
+    # still-running worker, which aborts the in-process app script
+    # (including any Start-Sleep polling loop it's sitting in). KNOWN
+    # LIMITATION, stated in the confirmation dialog too: stopping the
+    # PowerShell pipeline does NOT kill an external process the app
+    # script may have launched (msiexec, a vendor uninstall.exe, etc.) --
+    # if one of those is what's actually hung, it keeps running in the
+    # background and may need Task Manager attention separately.
+    $btnCancelStep = New-Object System.Windows.Forms.Button
+    $btnCancelStep.Text = 'Cancel'
+    $btnCancelStep.Location = New-Object System.Drawing.Point(1060, 590)
+    $btnCancelStep.Size = New-Object System.Drawing.Size(95, 30)
+    $btnCancelStep.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($btnCancelStep)
+    $btnCancelStep.Add_Click({
+        if ($state.AllDone) { return }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            ("Cancel the current step ('" + $state.CurrentApp + "') and return to the selection menu?`r`n`r`n" +
+             "The step's script will be aborted mid-run -- the app may be left partially installed/uninstalled, " +
+             "and if the script had launched an external installer process that is itself hung, that process may " +
+             "keep running in the background. Remaining queued apps will NOT run."),
+            'rww-installers - Cancel current step',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'WARN', "CANCELLED by the user during '$($state.CurrentApp)' -- aborting the run and returning to the selection menu. Remaining queued apps were not run."
+        try { Add-Content -Path $LogPath -Value $line } catch {}
+        $script:RWWContinueRequested = $true
+        $form.Close()
+    })
+
     $btnPause = New-Object System.Windows.Forms.Button
     $btnPause.Text = 'Pause'
-    $btnPause.Location = New-Object System.Drawing.Point(1055, 590)
+    $btnPause.Location = New-Object System.Drawing.Point(950, 590)
     $btnPause.Size = New-Object System.Drawing.Size(100, 30)
     $btnPause.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
     $form.Controls.Add($btnPause)
@@ -1596,6 +1633,7 @@ function Show-ProgressGui {
                 # above). Close still exits the app entirely.
                 $btnPause.Text = 'Continue'
                 $btnPause.Enabled = $true
+                $btnCancelStep.Enabled = $false
                 $btnClose.Enabled = $true
             }
         } catch {
@@ -1768,5 +1806,5 @@ while ($true) {
         exit $progressResult.ExitCode
     }
 
-    Write-Log "Continue clicked -- returning to the selection menu for another run."
+    Write-Log "Returning to the selection menu (Continue after a finished run, or a user cancel mid-run)."
 }
