@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Installs the SentinelOne Windows Agent via the MSI on the private
-    network share, passing the site token as an MSI property.
+    Installs the SentinelOne Windows Agent via the EXE installer on the
+    private network share, passing the site token with the -t switch.
     Designed to run elevated on a single box (RWW WorkstationDeployment
     project -- see Apps-Deploy-Menu.ps1).
 
@@ -13,19 +13,20 @@
     Source files (on the private share; not hosted in this public repo):
 
         \\svazdfs001\systems$\Software\SentinelOne EDR\Windows EDR Installer\
-            SentinelInstaller_windows_64bit_v22_3_5_887.msi
+            S1-Install-26.2.3.158.exe
             Site Token.txt
         (falls back to \\10.1.0.5\... if the hostname doesn't resolve)
 
     IMPORTANT -- same category of secret as ConnectWise Agent's SERVERPASS:
     the site token is what determines which SentinelOne tenant/site this
-    agent enrolls into. SentinelOne's own documentation confirms the token
-    is passed as the SITE_TOKEN MSI property (e.g.
-    "msiexec /i SentinelInstaller.msi /q SITE_TOKEN=..."). The MSI itself
-    doesn't contain the secret (unlike ConnectWise's MST, which had
-    SERVERPASS baked in), but this script still reads the token from the
-    private share at runtime and never writes its value to the log or
-    prints it to the console -- only whether it was successfully read.
+    agent enrolls into. SentinelOne's EXE installer (agent 22.2+) takes
+    the token with "-t <token>" and runs silently with "-q" (-q requires
+    -t). The MSI-style /QUIET and /NORESTART switches have no effect on
+    the EXE, so they are not used. The EXE itself doesn't contain the
+    secret (unlike ConnectWise's MST, which had SERVERPASS baked in), but
+    this script still reads the token from the private share at runtime
+    and never writes its value to the log or prints it to the console --
+    only whether it was successfully read.
 
     "Site Token.docx" and "Windows EDR install.docx" on the share are
     human-readable reference copies, not needed for automation -- this
@@ -33,11 +34,11 @@
 
     Steps:
       1. Skip if the SentinelOne agent is already detected.
-      2. Copy the MSI from the network share to local staging, and read
+      2. Copy the EXE from the network share to local staging, and read
          the site token text (not copied to disk anywhere outside the
-         staging folder's own use in the msiexec command).
-      3. msiexec /i <msi> /quiet /norestart SITE_TOKEN="<token>", with
-         retry/backoff on exit code 1618, same pattern as
+         staging folder's own use in the installer command line).
+      3. <exe> -t "<token>" -q, with retry/backoff on exit code 1618
+         (another install in progress), same pattern as
          Scripts/SecureConnect/Install-SecureClient-Automate.ps1 and
          CWAgentInst.ps1.
 
@@ -46,8 +47,8 @@
 
 .EXITCODES
     0 = success -- the agent was actually installed this run
-    1 = msiexec install failed
-    2 = could not reach/copy the MSI or read the site token from the share
+    1 = installer failed
+    2 = could not reach/copy the EXE or read the site token from the share
     3 = not running elevated
     4 = nothing to do -- the agent was already installed
 #>
@@ -60,13 +61,12 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $StageDir     = "$env:ProgramData\Dev\AppsDeploy\SentinelOne"
-$MsiLogPath   = "$env:ProgramData\Dev\AppsDeploy\Logs\SentinelOneInst-msi.log"
 $SharePaths   = @(
     '\\svazdfs001\systems$\Software\SentinelOne EDR\Windows EDR Installer',
     '\\10.1.0.5\systems$\Software\SentinelOne EDR\Windows EDR Installer'
 )
-$MsiFileName   = 'SentinelInstaller_windows_64bit_v22_3_5_887.msi'
-$TokenFileName = 'Site Token.txt'
+$InstallerFileName = 'S1-Install-26.2.3.158.exe'
+$TokenFileName     = 'Site Token.txt'
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -119,18 +119,18 @@ if (Test-SentinelOneInstalled) {
 
 $sourceDir = $null
 foreach ($candidate in $SharePaths) {
-    $msiCandidate   = Join-Path $candidate $MsiFileName
+    $exeCandidate   = Join-Path $candidate $InstallerFileName
     $tokenCandidate = Join-Path $candidate $TokenFileName
     Write-Log "Checking share path: $candidate"
-    if ((Test-Path $msiCandidate -ErrorAction SilentlyContinue) -and (Test-Path $tokenCandidate -ErrorAction SilentlyContinue)) {
+    if ((Test-Path $exeCandidate -ErrorAction SilentlyContinue) -and (Test-Path $tokenCandidate -ErrorAction SilentlyContinue)) {
         $sourceDir = $candidate
-        Write-Log "Found MSI and site token at: $candidate"
+        Write-Log "Found installer and site token at: $candidate"
         break
     }
 }
 
 if (-not $sourceDir) {
-    Write-Log "Could not reach the MSI and/or Site Token.txt on any known share path. Checked: $($SharePaths -join ', ')" 'ERROR'
+    Write-Log "Could not reach $InstallerFileName and/or Site Token.txt on any known share path. Checked: $($SharePaths -join ', ')" 'ERROR'
     exit 2
 }
 
@@ -146,25 +146,26 @@ try {
 
 try {
     if (-not (Test-Path $StageDir)) { New-Item -Path $StageDir -ItemType Directory -Force | Out-Null }
-    $localMsi = Join-Path $StageDir $MsiFileName
-    Write-Log "Staging MSI to $StageDir"
-    Copy-Item -LiteralPath (Join-Path $sourceDir $MsiFileName) -Destination $localMsi -Force
+    $localExe = Join-Path $StageDir $InstallerFileName
+    Write-Log "Staging installer to $StageDir"
+    Copy-Item -LiteralPath (Join-Path $sourceDir $InstallerFileName) -Destination $localExe -Force
 } catch {
-    Write-Log "Failed to copy the MSI from $sourceDir : $($_.Exception.Message)" 'ERROR'
+    Write-Log "Failed to copy the installer from $sourceDir : $($_.Exception.Message)" 'ERROR'
     exit 2
 }
 
-# SITE_TOKEN is passed as an MSI property, not logged in the command line
-# echo below -- only a redacted placeholder is written to the log.
-$msiArgsForLog = '/i "{0}" /quiet /norestart SITE_TOKEN="***REDACTED***" /lvx* "{1}"' -f $localMsi, $MsiLogPath
-$msiArgs       = '/i "{0}" /quiet /norestart SITE_TOKEN="{1}" /lvx* "{2}"' -f $localMsi, $siteToken, $MsiLogPath
+# The token is passed with -t and is not logged in the command line echo
+# below -- only a redacted placeholder is written to the log.
+# -q = quiet (requires -t). The EXE does not reboot the machine by default.
+$exeArgsForLog = '-t "***REDACTED***" -q'
+$exeArgs       = '-t "{0}" -q' -f $siteToken
 
 $maxAttempts = 6; $delay = 15; $finalCode = -1
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-    Write-Log "msiexec attempt $attempt/$maxAttempts : msiexec $msiArgsForLog"
-    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+    Write-Log "Installer attempt $attempt/$maxAttempts : $InstallerFileName $exeArgsForLog"
+    $proc = Start-Process -FilePath $localExe -ArgumentList $exeArgs -Wait -PassThru -NoNewWindow
     $finalCode = $proc.ExitCode
-    Write-Log "msiexec exit code: $finalCode"
+    Write-Log "Installer exit code: $finalCode"
     if ($finalCode -in @(0, 1641, 3010)) { break }
     if ($finalCode -eq 1618 -and $attempt -lt $maxAttempts) {
         Write-Log "Installer busy (1618). Waiting ${delay}s then retrying." 'WARN'
@@ -180,7 +181,7 @@ if ($finalCode -eq 3010 -or $finalCode -eq 1641) {
 } elseif ($finalCode -eq 0) {
     Write-Log "Install succeeded."
 } else {
-    Write-Log "Install FAILED (msiexec exit $finalCode). See $MsiLogPath." 'ERROR'
+    Write-Log "Install FAILED (installer exit $finalCode)." 'ERROR'
     Write-Log "=== Install-SentinelOne finished. Overall success: False ==="
     exit 1
 }
@@ -190,7 +191,7 @@ if (Test-SentinelOneInstalled) {
     Write-Log "=== Install-SentinelOne finished. Overall success: True ==="
     exit 0
 } else {
-    Write-Log "msiexec reported success but the agent was not detected afterward." 'ERROR'
+    Write-Log "The installer reported success but the agent was not detected afterward." 'ERROR'
     Write-Log "=== Install-SentinelOne finished. Overall success: False ==="
     exit 1
 }
