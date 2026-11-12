@@ -1,216 +1,148 @@
 <#
 .SYNOPSIS
-    Installs Windows Terminal on Windows Server 2022 variants.
+    Installs Windows Terminal on Windows Server 2022 (Desktop Experience) for all users.
 
 .DESCRIPTION
-    Designed to be run as a PowerShell "Execute Script" function in ConnectWise
-    Automate Control Center. Runs in the SYSTEM context under the LTAgent.
+    Designed to run unattended from ConnectWise Automate as SYSTEM.
+    - Downloads VCLibs, Microsoft.UI.Xaml 2.8, and the Windows Terminal msixbundle
+    - Provisions all three with Add-AppxProvisionedPackage so every user gets it at next sign-in
+    - Exits non-zero on any failure so Automate can flag it
 
-    Windows Terminal is distributed as an MSIX bundle and is NOT natively
-    provisioned on Windows Server. This script downloads Terminal plus its
-    framework dependencies (VCLibs + UI.Xaml) from the official Microsoft
-    GitHub release and provisions the package for ALL users via
-    Add-AppxProvisionedPackage -Online (the correct method under SYSTEM).
+    Nothing is installed per-user (Add-AppxPackage is useless under SYSTEM); provisioning
+    with -DependencyPackagePath stages the dependencies alongside the main package.
 
-    Exit codes (parse these in Automate):
-        0   = Success (installed or already present)
-        10  = Not a supported OS (requires Server 2022 / build 20348+)
-        20  = Download failure
-        30  = Dependency install failure
-        40  = Windows Terminal install failure
-        50  = Post-install verification failure
+.PARAMETER TerminalVersion
+    Pin a specific Windows Terminal release (e.g. 1.25.2733.0). Default: latest stable from GitHub.
+
+.PARAMETER WorkDir
+    Scratch folder for downloads. Default: C:\Temp\WindowsTerminal
 
 .NOTES
-    Target     : Windows Server 2022 (Standard, Datacenter, Core, Azure Edition)
-    Context    : SYSTEM (LTSvc / LTAgent)
-    Author     : Randy's Worldwide IT
+    Automate: run with the 64-bit PowerShell host. The agent is 32-bit, so either call
+    %windir%\sysnative\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File <path>
+    or rely on the relaunch guard at the top of this script.
+
+    Exit codes:
+      0  = success (or already installed)
+      1  = unsupported OS (build < 20348 or Server Core)
+      2  = download failure
+      3  = provisioning failure
 #>
 
-#Requires -Version 5.1
 [CmdletBinding()]
 param(
-    # Pin a specific Terminal version tag (e.g. 'v1.21.3231.0'). Leave blank for latest stable.
-    [string]$TerminalVersionTag = '',
-
-    # Force reinstall even if already present.
-    [switch]$Force
+    [string]$TerminalVersion = '',
+    [string]$WorkDir = 'C:\Temp\WindowsTerminal'
 )
 
-# ----------------------------------------------------------------------------
-# Environment / safety
-# ----------------------------------------------------------------------------
-$ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'   # massively speeds up Invoke-WebRequest
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# --- Relaunch in 64-bit PowerShell if we were started 32-bit (Automate agent is x86) ---
+if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    $ps64 = "$env:windir\sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    $argList = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', "`"$PSCommandPath`"")
+    if ($TerminalVersion) { $argList += @('-TerminalVersion', $TerminalVersion) }
+    $argList += @('-WorkDir', "`"$WorkDir`"")
+    $p = Start-Process -FilePath $ps64 -ArgumentList $argList -Wait -PassThru -NoNewWindow
+    exit $p.ExitCode
+}
 
-$WorkDir = Join-Path $env:TEMP ("WTInstall_{0}" -f ([guid]::NewGuid().ToString('N')))
-$script:ExitCode = 0
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Output "[$ts] [$Level] $Message"
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Write-Output $line
+    try { Add-Content -Path (Join-Path $WorkDir 'install.log') -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
-function Invoke-Download {
-    param([string]$Uri, [string]$OutFile)
-    Write-Log "Downloading: $Uri"
-    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
-    if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
-        throw "Download produced an empty file: $OutFile"
-    }
+# --- OS checks ---
+$build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+$installType = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').InstallationType
+
+New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+Write-Log "Starting Windows Terminal provisioning on $env:COMPUTERNAME (build $build, $installType)"
+
+if ($build -lt 20348) {
+    Write-Log "Build $build is below 20348 (Server 2022). Windows Terminal is not supported on this OS." 'ERROR'
+    exit 1
+}
+if ($installType -eq 'Server Core') {
+    Write-Log 'Server Core detected. Windows Terminal requires Desktop Experience.' 'ERROR'
+    exit 1
 }
 
-# ----------------------------------------------------------------------------
-# 1. Validate OS — Server 2022 is build 20348
-# ----------------------------------------------------------------------------
+# --- Resolve Terminal download URL ---
+$ghHeaders = @{ 'User-Agent' = 'Automate-WT-Installer' }
 try {
-    $os        = Get-CimInstance -ClassName Win32_OperatingSystem
-    $buildNum  = [int]($os.BuildNumber)
-    $caption   = $os.Caption
-    Write-Log "Detected OS: $caption (Build $buildNum)"
-
-    $isServer = ($os.ProductType -ne 1)   # 1 = Workstation, 2 = DC, 3 = Server
-    if (-not $isServer -or $buildNum -lt 20348) {
-        Write-Log "This script targets Windows Server 2022 (build 20348+). Aborting." 'ERROR'
-        exit 10
+    if ($TerminalVersion) {
+        $releaseUri = "https://api.github.com/repos/microsoft/terminal/releases/tags/v$TerminalVersion"
+    } else {
+        $releaseUri = 'https://api.github.com/repos/microsoft/terminal/releases/latest'
     }
-}
-catch {
-    Write-Log "OS detection failed: $($_.Exception.Message)" 'ERROR'
-    exit 10
+    $release = Invoke-RestMethod -Uri $releaseUri -Headers $ghHeaders
+    $asset = $release.assets | Where-Object { $_.name -like 'Microsoft.WindowsTerminal_*_8wekyb3d8bbwe.msixbundle' } | Select-Object -First 1
+    if (-not $asset) { throw "No msixbundle asset found in release $($release.tag_name)" }
+    $resolvedVersion = ($asset.name -replace '^Microsoft\.WindowsTerminal_([\d\.]+)_.*$', '$1')
+    Write-Log "Target Windows Terminal version: $resolvedVersion"
+} catch {
+    Write-Log "Failed to resolve Terminal release: $($_.Exception.Message)" 'ERROR'
+    exit 2
 }
 
-# ----------------------------------------------------------------------------
-# 2. Already installed?
-# ----------------------------------------------------------------------------
-$existing = Get-AppxProvisionedPackage -Online |
-            Where-Object { $_.DisplayName -eq 'Microsoft.WindowsTerminal' }
-
-if ($existing -and -not $Force) {
-    Write-Log "Windows Terminal is already provisioned (v$($existing.Version)). Use -Force to reinstall."
+# --- Idempotency: skip if this version (or newer) is already provisioned ---
+$existing = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq 'Microsoft.WindowsTerminal' }
+if ($existing -and [version]$existing.Version -ge [version]$resolvedVersion) {
+    Write-Log "Windows Terminal $($existing.Version) already provisioned. Nothing to do."
     exit 0
 }
 
-# ----------------------------------------------------------------------------
-# 3. Resolve download assets from GitHub releases
-# ----------------------------------------------------------------------------
-New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-
-try {
-    if ([string]::IsNullOrWhiteSpace($TerminalVersionTag)) {
-        $apiUrl = 'https://api.github.com/repos/microsoft/terminal/releases/latest'
-    } else {
-        $apiUrl = "https://api.github.com/repos/microsoft/terminal/releases/tags/$TerminalVersionTag"
-    }
-
-    Write-Log "Querying release metadata: $apiUrl"
-    $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'RandysWW-Automate' }
-
-    # The release ships a single .msixbundle that already contains x64/arm64.
-    $bundleAsset = $release.assets |
-        Where-Object { $_.name -like '*.msixbundle' -and $_.name -notlike '*PreinstallKit*' } |
-        Select-Object -First 1
-
-    if (-not $bundleAsset) {
-        throw "Could not locate a .msixbundle asset in release $($release.tag_name)."
-    }
-
-    Write-Log "Selected Terminal package: $($bundleAsset.name) ($($release.tag_name))"
-    $bundlePath = Join-Path $WorkDir $bundleAsset.name
-    Invoke-Download -Uri $bundleAsset.browser_download_url -OutFile $bundlePath
-}
-catch {
-    Write-Log "Failed to resolve/download Windows Terminal: $($_.Exception.Message)" 'ERROR'
-    Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-    exit 20
-}
-
-# ----------------------------------------------------------------------------
-# 4. Download framework dependencies
-#    Terminal needs VCLibs Desktop + Microsoft.UI.Xaml 2.8 (x64).
-# ----------------------------------------------------------------------------
-$dependencies = @(
-    @{
-        Name = 'Microsoft.VCLibs.140.00.UWPDesktop'
-        Uri  = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
-        File = 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
-    },
-    @{
-        Name = 'Microsoft.UI.Xaml.2.8'
-        Uri  = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx'
-        File = 'Microsoft.UI.Xaml.2.8.x64.appx'
-    }
+# --- Downloads ---
+$downloads = @(
+    @{ Name = 'VCLibs';   Url = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx';                                                     File = 'Microsoft.VCLibs.x64.14.00.Desktop.appx' }
+    @{ Name = 'UI.Xaml';  Url = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx';     File = 'Microsoft.UI.Xaml.2.8.x64.appx' }
+    @{ Name = 'Terminal'; Url = $asset.browser_download_url;                                                                                   File = $asset.name }
 )
 
-$depPaths = @()
-try {
-    foreach ($dep in $dependencies) {
-        $out = Join-Path $WorkDir $dep.File
-        Invoke-Download -Uri $dep.Uri -OutFile $out
-        $depPaths += $out
+foreach ($d in $downloads) {
+    $dest = Join-Path $WorkDir $d.File
+    if (Test-Path $dest) {
+        Write-Log "$($d.Name): already downloaded, reusing $dest"
+        continue
     }
-}
-catch {
-    Write-Log "Failed to download dependencies: $($_.Exception.Message)" 'ERROR'
-    Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-    exit 20
-}
-
-# ----------------------------------------------------------------------------
-# 5. Install dependencies (provision for all users)
-# ----------------------------------------------------------------------------
-foreach ($depPath in $depPaths) {
     try {
-        Write-Log "Provisioning dependency: $(Split-Path $depPath -Leaf)"
-        Add-AppxProvisionedPackage -Online -PackagePath $depPath -SkipLicense | Out-Null
-    }
-    catch {
-        # A dependency already present at an equal/newer version is non-fatal.
-        if ($_.Exception.Message -match '0x80073D06|already installed|higher version') {
-            Write-Log "Dependency already present (newer/equal version) — continuing." 'WARN'
-        }
-        else {
-            Write-Log "Dependency provisioning failed: $($_.Exception.Message)" 'ERROR'
-            Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-            exit 30
-        }
+        Write-Log "$($d.Name): downloading $($d.Url)"
+        Invoke-WebRequest -Uri $d.Url -OutFile $dest -UseBasicParsing
+        if ((Get-Item $dest).Length -lt 100KB) { throw 'Downloaded file is suspiciously small' }
+    } catch {
+        Write-Log "$($d.Name): download failed - $($_.Exception.Message)" 'ERROR'
+        Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        exit 2
     }
 }
 
-# ----------------------------------------------------------------------------
-# 6. Install Windows Terminal
-# ----------------------------------------------------------------------------
+# --- Provision for all users ---
+$bundlePath = Join-Path $WorkDir $asset.name
+$depPaths   = @(
+    (Join-Path $WorkDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx'),
+    (Join-Path $WorkDir 'Microsoft.UI.Xaml.2.8.x64.appx')
+)
+
 try {
-    Write-Log "Provisioning Windows Terminal for all users..."
-    $wtParams = @{
-        Online                = $true
-        PackagePath           = $bundlePath
-        DependencyPackagePath = $depPaths
-        SkipLicense           = $true
-    }
-    Add-AppxProvisionedPackage @wtParams | Out-Null
-}
-catch {
-    Write-Log "Windows Terminal provisioning failed: $($_.Exception.Message)" 'ERROR'
-    Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-    exit 40
+    Write-Log 'Provisioning Windows Terminal with dependencies (all users)...'
+    Add-AppxProvisionedPackage -Online -PackagePath $bundlePath -DependencyPackagePath $depPaths -SkipLicense | Out-Null
+} catch {
+    Write-Log "Provisioning failed: $($_.Exception.Message)" 'ERROR'
+    Write-Log 'Check C:\Windows\Logs\DISM\dism.log for details.' 'ERROR'
+    exit 3
 }
 
-# ----------------------------------------------------------------------------
-# 7. Verify
-# ----------------------------------------------------------------------------
-Start-Sleep -Seconds 3
-$verify = Get-AppxProvisionedPackage -Online |
-          Where-Object { $_.DisplayName -eq 'Microsoft.WindowsTerminal' }
-
-Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-
-if ($verify) {
-    Write-Log "SUCCESS: Windows Terminal v$($verify.Version) provisioned. Available after next user logon."
+# --- Verify ---
+$prov = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq 'Microsoft.WindowsTerminal' }
+if ($prov) {
+    Write-Log "SUCCESS: Windows Terminal $($prov.Version) provisioned. Users will see it at next sign-in."
     exit 0
-}
-else {
-    Write-Log "Verification failed: Windows Terminal not found after install." 'ERROR'
-    exit 50
+} else {
+    Write-Log 'Provisioning command completed but package is not listed. Investigate.' 'ERROR'
+    exit 3
 }
