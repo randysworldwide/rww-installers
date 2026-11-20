@@ -54,8 +54,3 @@ Utilities: 7-Zip · VLC · Windows Terminal · Windows App · Logi Options+ · C
 - Bench the last three on suitable hardware: CW Automate Agent (expendable box; seat consumed per install), Acrobat Pro (licensed sign-in machine; also the Reader+Pro coexistence check), Cisco Secure Client wrapper.
 - Push `Scripts/AppsDeploy2/` to main when ready; production .bat already points there. Then production pilot.
 - Decommission v1's rename/join/reboot-resume/throwaway-account machinery. RPS Reporting Center shortcuts deferred pending Intune approach.
-
-## Next steps
-- Bench the last three on suitable hardware: CW Automate Agent (expendable box; seat consumed per install), Acrobat Pro (licensed sign-in machine; also the Reader+Pro coexistence check), Cisco Secure Client wrapper.
-- Push `Scripts/AppsDeploy2/` to main when ready; production .bat already points there. Then production pilot.
-- Decommission v1's rename/join/reboot-resume/throwaway-account machinery. RPS Reporting Center shortcuts deferred pending Intune approach.
