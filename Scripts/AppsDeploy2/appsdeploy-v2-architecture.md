@@ -21,7 +21,7 @@ Logs: `C:\ProgramData\RWW\AppsDeploy\Logs\` — one log plus the job plan per ru
 
 **1. The UI and the worker are separate processes.** In v1, installs ran inside the GUI process and heavy installers froze the window. In v2 the UI writes a job file, launches the worker, and just tails its log. They share nothing else, so the GUI cannot freeze no matter what an installer does.
 
-**2. Detection is the truth, not exit codes.** Installers lie — Logi Options+ returns an "error" code on success, and ZAC's v1 "chronic failures" were actually successes. So every app has a detection check (is it really installed?). The worker detects before each step (skip if already done) and after (that result, not the exit code, decides pass/fail). The menu checkboxes always show what's actually on the machine.
+**2. Detection is the truth, not exit codes.** Installers lie — Logi Options+ returns an "error" code on success, and ZAC's v1 "chronic failures" were actually successes. So every app has a detection check (is it really installed?). The worker detects before each step (skip if already done) and after (that result, not the exit code, decides pass/fail). The menu checkboxes always show what's actually on the machine. One deliberate exception: an **Update** step also requires a sane winget exit code, because detection can only see "still installed," which is true whether or not an update happened — a broken winget once produced an all-green update run that updated nothing.
 
 **3. One install method per app, no automatic fallbacks.** An early build tried a second method when the first failed. That made failures ambiguous and the code hard to trust, so it was removed: each app has exactly one silent install method and one uninstall method, which works or fails clearly in the log. If an app keeps failing silently, the tech lights its **wrench** (below) to get the vendor's normal wizard — the only fallback, and a visible per-app human choice.
 
@@ -52,6 +52,24 @@ Each manifest entry names one engine for install and one for uninstall (a repair
 
 **Key pattern:** winget *installs* are reliable, but its "silent" *uninstalls* often pop the vendor's full wizard (VLC, VS Code, Firefox). Those apps install with Winget and uninstall with Registry.
 
+### winget and the elevation account — read this before debugging winget failures
+
+**winget only works for the user who is signed in at the console.** Its source data arrives as a per-user MSIX package, and Windows refuses to register a package for an account that has no logon session (AppX error 0x80073D19, "an error occurred because a user was logged off"). So a tech who elevates with their separate admin account on a user's machine gets `0x8A15000F` on every winget call — downloads "succeed," nothing registers, nothing is findable. This is how Windows works, not a fault on the machine. It cost a full afternoon of diagnosis on WSWA1ITG070 (signed in as the daily account, tool elevated as the admin account) before the AppxDeploymentServer event log named it.
+
+The worker now detects this: on a winget source error it compares the running account to the console user, and on a mismatch it explains the situation in one message and skips winget for the run instead of attempting repairs. **Non-winget engines are unaffected** — MSI, ODT/Office, Registry uninstalls, and the share-based Custom installs (CW agent, Cisco, MXAdmin) all work fine from an elevation-only account. To use winget-based entries on a user's machine, sign in to the machine as the admin account (console or RDP), or run from an elevated session of the signed-in user.
+
+### winget self-heal ladder
+
+The first winget step of every run logs the client version. When winget fails with a source error on an account that IS the console user, the Winget engine climbs an escalation ladder on its own, each rung fixing a real failure class:
+
+1. `winget source update` + retry (stale source cache).
+2. `winget source reset --force` + retry (broken source list).
+3. Purge the cached source data — the `Microsoft.Winget.Source` package and App Installer's data folders — + retry (a reset rewrites the list, not the data; the purge logs exactly what it could and couldn't delete).
+4. Update the winget client itself + retry. Cheapest first: a newer App Installer already **staged** on the machine but not registered for this user gets registered (one command, no download — profiles can carry different versions). Otherwise it checks **both** GitHub's latest release and `aka.ms/getwinget` — not in sync, GitHub often runs ahead — and skips the ~200 MB download when nothing newer is served.
+5. Reset the App Installer package (same as Settings > Apps > App Installer > Reset) + retry (its data folders persist across client reinstalls).
+
+Only after all five fail is winget declared dead for the rest of the run: later winget steps fail fast with one clear line each, and the tool fetches the source index **directly from `cdn.winget.microsoft.com`** and reports the verdict — a real package (PK signature) means the problem is machine-local; HTML/garbage or a blocked fetch means a web filter or SSL inspection is the root cause. For anything deeper: `winget source update --verbose-logs` (log lands in `...\LocalState\DiagOutputDir`) and the AppxDeploymentServer/Operational event log say exactly what failed.
+
 ## Office
 
 Office products install via the ODT `setup.exe` from the software share, with a minimal config generated on the fly (one product, en-US). Each product (M365 Apps, Office 2021, Project, Visio, standalone Outlook) is its own menu entry. Installs are slow and silent, so the log reports Click-to-Run's disk usage every 30 seconds and warns if it stalls.
@@ -69,7 +87,7 @@ Apps installed from `\\svazdfs001\systems$` are tagged "(uses network share)" in
 - **Categories** in deployment order (Runtimes → Agents → Office → Communications → Browsers → Utilities → Development), alphabetical within.
 - **Profiles** — "Standard" and "Developer" pre-check a known-good app set on top of whatever's installed. Profiles never uncheck or uninstall anything. Lists live in the manifest; a new role for deployment = a new profile there (a name plus a list of app names).
 - **Rescan** — re-detect everything on demand.
-- **Update installed apps** — `winget upgrade` across winget-managed apps; self-updaters (Chrome, Claude) skipped.
+- **Update installed apps** — `winget upgrade` across winget-managed apps; self-updaters (Chrome, Claude) skipped. An update only counts as a success if winget actually ran (see design rule 2).
 - **Site dropdown** on the ConnectWise agent row (inboard of the wrench) — picks which client site the agent binds to. Proceeding with the default "New PCs" still selected asks for confirmation, because installing an agent under the wrong site is an easy mistake. The choice also rides a repair.
 - **Liveness** — a status dot, an elapsed/last-output ticker, and streamed installer output, so a quiet log never leaves you guessing whether it's alive.
 
@@ -89,7 +107,7 @@ WPF can't render on hidden desktops — Backstage gets a black window, full stop
 | MSIX apps (Terminal, Windows App, Claude) | Detect by exact package name (`-AllUsers`); loose wildcards match the wrong packages. Per-user winget install; uninstall removes + de-provisions. Terminal's auto-launch after install gets auto-closed (skipped on repairs — a running Terminal could be the tech's own). Claude uses Anthropic's evergreen MSIX URL and self-updates, so re-provisioning the same version on a repair is refused by Windows — logged as a warning, not a failure. |
 | VC++ Redistributables | One checkbox = 2010/2012/2013/2015+ × both architectures. Microsoft renamed "2015-2022" to "v14" in new builds; detection accepts both. |
 | Office 2021 | Detect string is `*Office LTSC*2021*` — v1's pattern never matched (latent bug). |
-| winget itself | If broken machine-wide (0x8A15000F): `winget source reset --force`. |
+| winget itself | Persistent 0x8A15000F on an account that is NOT the console user = the elevation-account limitation above, not a broken machine (the WSWA1ITG070 saga). On the console user's own account, source errors self-heal via the five-rung ladder. |
 
 Full details for every app are in the manifest.
 
@@ -106,8 +124,4 @@ These each cost real debugging time; don't reintroduce them.
 
 ## Status
 
-The GUI/feature set is considered settled for now; the roster will keep growing as more roles come up for deployment (new apps = manifest entries, new roles = profiles). All 27 apps proven on real machines except the ConnectWise agent (needs an expendable test box — each install burns a seat). Remaining: push the current wrench/repair build to GitHub (the repo still holds the pre-repair version), run the bat from the Automate Toolbox end-to-end once, bench the CW agent, pilot, then decommission v1.
-## Next steps
-- Bench the last three on suitable hardware: CW Automate Agent (expendable box; seat consumed per install), Acrobat Pro (licensed sign-in machine; also the Reader+Pro coexistence check), Cisco Secure Client wrapper.
-- Push `Scripts/AppsDeploy2/` to main when ready; production .bat already points there. Then production pilot.
-- Decommission v1's rename/join/reboot-resume/throwaway-account machinery. RPS Reporting Center shortcuts deferred pending Intune approach.
+The GUI/feature set is considered settled for now; the roster will keep growing as more roles come up for deployment (new apps = manifest entries, new roles = profiles). All 27 apps proven on real machines except the ConnectWise agent (needs an expendable test box — each install burns a seat). The WSWA1ITG070 winget mystery is RESOLVED (elevation-account limitation, above). Remaining: push the current build (wrench/repair, update verdicts, winget self-heal ladder + elevation-mismatch detection) to GitHub — the repo still holds the pre-repair version; run the bat from the Automate Toolbox end-to-end once; bench the CW agent; pilot; then decommission v1.
