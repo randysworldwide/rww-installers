@@ -654,8 +654,8 @@ $script:AeroResources
 
     $appendLine = {
         param([string]$line)
-        if ($line -match '^::STEP::(\d+)/(\d+)::(.+?)::(Install|Uninstall|Update)$') {
-            $verb = switch ($Matches[4]) { 'Install' { 'Installing' } 'Update' { 'Updating' } default { 'Uninstalling' } }
+        if ($line -match '^::STEP::(\d+)/(\d+)::(.+?)::(Install|Uninstall|Update|Repair)$') {
+            $verb = switch ($Matches[4]) { 'Install' { 'Installing' } 'Update' { 'Updating' } 'Repair' { 'Repairing' } default { 'Uninstalling' } }
             $state.CurrentApp = $Matches[3]
             $state.CurrentAction = $Matches[4]
             $header.Text = "${verb}: $($Matches[3])"
@@ -846,7 +846,9 @@ $script:AeroResources
 
         if ($state.CurrentApp) {
             & $uiLog "Starting best-effort cleanup sweep for '$($state.CurrentApp)' (an interrupted MSI already rolled itself back; this catches the rest)." 'INFO'
-            $sweepAct = if ($state.CurrentAction -eq 'Update') { 'Install' } else { 'Uninstall' }
+            # A cancelled Update or Repair can't be rolled back -- the
+            # sweep re-runs the installer instead (repair by reinstall).
+            $sweepAct = if ($state.CurrentAction -in @('Update', 'Repair')) { 'Install' } else { 'Uninstall' }
             $sweepArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$workerPath`" -CleanupApp `"$($state.CurrentApp)`" -CleanupAction $sweepAct -LogFile `"$logFile`" -ManifestPath `"$ManifestPath`""
             $spsi = New-Object System.Diagnostics.ProcessStartInfo
             $spsi.FileName = $psExe
@@ -933,10 +935,7 @@ $script:AeroResources
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <ToggleButton Grid.Column="0" x:Name="InteractiveToggle" Style="{StaticResource AeroToggle}"
-                                  Content="Interactive installers: OFF"
-                                  ToolTip="OFF (default): everything runs silently -- the only window you see is the progress window. ON: each app's own installer/uninstaller UI is shown, for modify/repair-style work."/>
-                    <Button Grid.Column="1" x:Name="BtnUpdate" Style="{StaticResource AeroButton}" Content="Update installed apps" Margin="10,0,0,0"
+                    <Button Grid.Column="1" x:Name="BtnUpdate" Style="{StaticResource AeroButton}" Content="Update installed apps"
                             ToolTip="Checks every installed, winget-managed app in this menu for a newer version and applies any found. Apps that manage their own updates (e.g. Chrome) are skipped."/>
                     <TextBlock Grid.Column="2" x:Name="IdleText" FontSize="12" Foreground="#FF1C6FAE" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,14,0"/>
                     <Button Grid.Column="3" x:Name="BtnQuit" Style="{StaticResource AeroButton}" Content="Cancel" MinWidth="100" Margin="0,0,10,0"/>
@@ -950,9 +949,8 @@ $script:AeroResources
     $win = New-WindowFromXaml $xaml
     $win.Title += $script:TitleSuffix
     $panel  = $win.FindName('CategoryPanel')
-    $toggle = $win.FindName('InteractiveToggle')
-    $toggle.Add_Checked({   $toggle.Content = 'Interactive installers: ON'  }.GetNewClosure())
-    $toggle.Add_Unchecked({ $toggle.Content = 'Interactive installers: OFF' }.GetNewClosure())
+    # The old global 'Interactive installers' toggle is gone: per-row
+    # wrench buttons carry interactivity now, one app at a time.
 
     # 30-minute idle timer for the whole app: if nobody clicks Proceed
     # for this long, the menu was forgotten -- close completely. The
@@ -997,6 +995,12 @@ $script:AeroResources
     $baseline      = @{}
     $stateLabels   = @{}
     $pendingLabels = @{}
+    $wrenchQueue   = @{}   # app name -> $true while the row's wrench is lit (run interactively / repair)
+    $wrenchButtons = @{}
+    # The wrench-and-gear icon, as WPF Path geometry (same grammar as SVG
+    # path data; F1 = nonzero fill so the ring and jaw cutout subpaths,
+    # wound the other way, read as holes while the wrench may overlap).
+    $wrenchIconData = 'F1 M 21.40,12.00 L 21.16,14.12 L 22.88,15.07 L 21.86,17.52 L 19.98,16.97 L 18.65,18.65 L 16.97,19.98 L 17.52,21.86 L 15.07,22.88 L 14.12,21.16 L 12.00,21.40 L 9.88,21.16 L 8.93,22.88 L 6.48,21.86 L 7.03,19.98 L 5.35,18.65 L 4.02,16.97 L 2.14,17.52 L 1.12,15.07 L 2.84,14.12 L 2.60,12.00 L 2.84,9.88 L 1.12,8.93 L 2.14,6.48 L 4.02,7.03 L 5.35,5.35 L 7.03,4.02 L 6.48,2.14 L 8.93,1.12 L 9.88,2.84 L 12.00,2.60 L 14.12,2.84 L 15.07,1.12 L 17.52,2.14 L 16.97,4.02 L 18.65,5.35 L 19.98,7.03 L 21.86,6.48 L 22.88,8.93 L 21.16,9.88 Z M 18.90,12.00 L 18.82,10.92 L 18.56,9.87 L 18.15,8.87 L 17.58,7.94 L 16.88,7.12 L 16.06,6.42 L 15.13,5.85 L 14.13,5.44 L 13.08,5.18 L 12.00,5.10 L 10.92,5.18 L 9.87,5.44 L 8.87,5.85 L 7.94,6.42 L 7.12,7.12 L 6.42,7.94 L 5.85,8.87 L 5.44,9.87 L 5.18,10.92 L 5.10,12.00 L 5.18,13.08 L 5.44,14.13 L 5.85,15.13 L 6.42,16.06 L 7.12,16.88 L 7.94,17.58 L 8.87,18.15 L 9.87,18.56 L 10.92,18.82 L 12.00,18.90 L 13.08,18.82 L 14.13,18.56 L 15.13,18.15 L 16.06,17.58 L 16.88,16.88 L 17.58,16.06 L 18.15,15.13 L 18.56,14.13 L 18.82,13.08 Z M 14.38,17.07 L 10.78,13.47 L 10.78,13.47 L 10.33,13.57 L 9.88,13.62 L 9.42,13.61 L 8.97,13.55 L 8.53,13.44 L 8.10,13.28 L 7.70,13.07 L 7.32,12.82 L 6.97,12.52 L 6.67,12.18 L 6.40,11.81 L 6.18,11.41 L 6.00,10.99 L 5.88,10.55 L 5.80,10.10 L 5.78,9.65 L 5.82,9.19 L 5.90,8.74 L 6.04,8.31 L 6.23,7.89 L 8.40,10.06 L 8.40,10.06 L 8.50,10.15 L 8.62,10.23 L 8.75,10.30 L 8.88,10.35 L 9.02,10.38 L 9.16,10.40 L 9.30,10.40 L 9.44,10.38 L 9.58,10.35 L 9.71,10.30 L 9.84,10.23 L 9.95,10.15 L 10.06,10.06 L 10.15,9.95 L 10.23,9.84 L 10.30,9.71 L 10.35,9.58 L 10.38,9.44 L 10.40,9.30 L 10.40,9.16 L 10.38,9.02 L 10.35,8.88 L 10.30,8.75 L 10.23,8.62 L 10.15,8.50 L 10.06,8.40 L 7.89,6.23 L 7.89,6.23 L 8.31,6.04 L 8.74,5.90 L 9.19,5.82 L 9.65,5.78 L 10.10,5.80 L 10.55,5.88 L 10.99,6.00 L 11.41,6.18 L 11.81,6.40 L 12.18,6.67 L 12.52,6.97 L 12.82,7.32 L 13.07,7.70 L 13.28,8.10 L 13.44,8.53 L 13.55,8.97 L 13.61,9.42 L 13.62,9.88 L 13.57,10.33 L 13.47,10.78 L 17.07,14.38 L 17.07,14.38 L 17.22,14.55 L 17.35,14.74 L 17.46,14.94 L 17.54,15.16 L 17.60,15.38 L 17.62,15.61 L 17.62,15.84 L 17.60,16.07 L 17.54,16.29 L 17.46,16.50 L 17.35,16.71 L 17.22,16.90 L 17.07,17.07 L 16.90,17.22 L 16.71,17.35 L 16.50,17.46 L 16.29,17.54 L 16.07,17.60 L 15.84,17.62 L 15.61,17.62 L 15.38,17.60 L 15.16,17.54 L 14.94,17.46 L 14.74,17.35 L 14.55,17.22 L 14.38,17.07 Z'
 
     # Build the category cards once; detection fills them (and refills on
     # every return from a run).
@@ -1062,19 +1066,51 @@ $script:AeroResources
             [void]$sp.Children.Add($stateTb); [void]$sp.Children.Add($pendingTb)
             $cb.Content = $sp
             if ($app.Notes) { $cb.ToolTip = $app.Notes }
+            # Every row is a grid: the checkbox stretches, a small Repair
+            # toggle sits at the right edge, and apps with Variants get
+            # their dropdown on the far right.
+            $rowGrid = New-Object System.Windows.Controls.Grid
+            foreach ($w in @('*', 'Auto', 'Auto')) {
+                $cd = New-Object System.Windows.Controls.ColumnDefinition
+                $cd.Width = $w
+                [void]$rowGrid.ColumnDefinitions.Add($cd)
+            }
+            $cb.VerticalAlignment = 'Center'
+            [System.Windows.Controls.Grid]::SetColumn($cb, 0)
+            [void]$rowGrid.Children.Add($cb)
+
+            # The wrench (Aaron's design): ONE per-row control that
+            # replaces the old global 'Interactive installers' toggle.
+            # Lit, it means 'show the vendor's own installer window for
+            # this app': an interactive install or uninstall when the
+            # row has a pending change, and a REPAIR (the vendor's
+            # Repair/Modify wizard) when the app is installed and
+            # staying. It shows on any row that has an installer to
+            # show -- installed now, or checked to be installed.
+            $repBtn = New-Object System.Windows.Controls.Primitives.ToggleButton
+            $repIcon = New-Object System.Windows.Shapes.Path
+            $repIcon.Data = [System.Windows.Media.Geometry]::Parse($wrenchIconData)
+            $repIcon.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString('#FF2B3A46'))
+            $repIcon.Stretch = 'Uniform'
+            $repIcon.Width = 16
+            $repIcon.Height = 16
+            $repBtn.Content = $repIcon
+            $repBtn.Style = $win.FindResource('AeroToggle')   # lit = green, same language as the old toggle
+            $repBtn.Padding = '6,3'
+            $repBtn.Margin = '10,2,2,2'
+            $repBtn.VerticalAlignment = 'Center'
+            $repBtn.Visibility = 'Collapsed'
+            $repBtn.ToolTip = "Use the vendor's own installer window for this app instead of running silently. On an app that is installed and staying installed, this queues a REPAIR -- the vendor's setup opens so you can choose Repair/Modify."
+            # The wrench always sits at the FAR RIGHT edge of the row
+            # (Aaron's layout call); any variant dropdown goes inboard
+            # of it, in the middle Auto column.
+            [System.Windows.Controls.Grid]::SetColumn($repBtn, 2)
+            [void]$rowGrid.Children.Add($repBtn)
+
             if ($app.ContainsKey('Variants')) {
-                # Variant dropdown, right edge of the row (e.g. which
-                # Automate SITE installer to use). The selection only
-                # matters for installs; it rides the job file to the
-                # worker as the step's Variant.
-                $rowGrid = New-Object System.Windows.Controls.Grid
-                $c0 = New-Object System.Windows.Controls.ColumnDefinition; $c0.Width = '*'
-                $c1 = New-Object System.Windows.Controls.ColumnDefinition; $c1.Width = 'Auto'
-                [void]$rowGrid.ColumnDefinitions.Add($c0)
-                [void]$rowGrid.ColumnDefinitions.Add($c1)
-                $cb.VerticalAlignment = 'Center'
-                [System.Windows.Controls.Grid]::SetColumn($cb, 0)
-                [void]$rowGrid.Children.Add($cb)
+                # Variant dropdown (e.g. which Automate SITE installer to
+                # use). The selection rides the job file to the worker as
+                # the step's Variant, for installs and repairs alike.
                 $combo = New-Object System.Windows.Controls.ComboBox
                 $combo.MinWidth = 150
                 $combo.Margin = '10,2,2,2'
@@ -1090,14 +1126,13 @@ $script:AeroResources
                 }.GetNewClosure())
                 [System.Windows.Controls.Grid]::SetColumn($combo, 1)
                 [void]$rowGrid.Children.Add($combo)
-                [void]$inner.Children.Add($rowGrid)
                 $variantCombos[$app.Name] = $combo
-            } else {
-                [void]$inner.Children.Add($cb)
             }
+            [void]$inner.Children.Add($rowGrid)
             $checkboxes[$app.Name]    = $cb
             $stateLabels[$app.Name]   = $stateTb
             $pendingLabels[$app.Name] = $pendingTb
+            $wrenchButtons[$app.Name] = $repBtn
 
             # Locals for the closure (GetNewClosure captures per-iteration
             # copies -- exactly what a loop needs; and no $script: refs,
@@ -1107,18 +1142,41 @@ $script:AeroResources
                 & $restartIdle   # activity resets the idle countdown
                 $have = [bool]$baseline[$appName]
                 $want = [bool]$cb.IsChecked
+                # The wrench shows wherever there is an installer to
+                # show: the app is installed now, or checked to become
+                # installed. A row that is absent and staying absent has
+                # nothing to run, so the wrench hides and clears.
+                if ($have -or $want) {
+                    $repBtn.Visibility = 'Visible'
+                } else {
+                    $repBtn.Visibility = 'Collapsed'
+                    $wrenchQueue[$appName] = $false
+                    if ($repBtn.IsChecked) { $repBtn.IsChecked = $false }   # re-fires this handler once, harmlessly
+                }
+                $wrench = [bool]$wrenchQueue[$appName]
                 if ($want -and -not $have) {
-                    $pendingTb.Text = '  (will be INSTALLED)'
+                    $pendingTb.Text = if ($wrench) { '  (will be INSTALLED - vendor window shown)' } else { '  (will be INSTALLED)' }
                     $pendingTb.Foreground = '#FF1565C0'
                 } elseif (-not $want -and $have) {
-                    $pendingTb.Text = '  (will be UNINSTALLED)'
+                    $pendingTb.Text = if ($wrench) { '  (will be UNINSTALLED - vendor window shown)' } else { '  (will be UNINSTALLED)' }
                     $pendingTb.Foreground = '#FFC62828'
+                } elseif ($want -and $have -and $wrench) {
+                    $pendingTb.Text = '  (will be REPAIRED - vendor window shown)'
+                    $pendingTb.Foreground = '#FFB26A00'
                 } else {
                     $pendingTb.Text = ''
                 }
             }.GetNewClosure()
             $cb.Add_Checked($pendingHandler)
             $cb.Add_Unchecked($pendingHandler)
+            $repBtn.Add_Checked({
+                $wrenchQueue[$appName] = $true
+                & $pendingHandler
+            }.GetNewClosure())
+            $repBtn.Add_Unchecked({
+                $wrenchQueue[$appName] = $false
+                & $pendingHandler
+            }.GetNewClosure())
         }
     }
 
@@ -1150,6 +1208,14 @@ $script:AeroResources
             $lbl = $stateLabels[$app.Name]
             $lbl.Text = if ($installed) { '  (installed)' } else { '  (not installed)' }
             $lbl.Foreground = if ($installed) { '#FF2E7D32' } else { '#FF8A8A8A' }
+            # A rescan clears every lit wrench (the world just changed
+            # under them). The wrench shows wherever something could run
+            # interactively; after a rescan box state = installed state,
+            # so that is simply the installed rows.
+            $wrenchQueue[$app.Name] = $false
+            $rb = $wrenchButtons[$app.Name]
+            if ($rb.IsChecked) { $rb.IsChecked = $false }
+            $rb.Visibility = if ($installed) { 'Visible' } else { 'Collapsed' }
             # Clear the pending label explicitly: setting IsChecked to a
             # value it already has fires no event, so a stale pending tag
             # from before the run could otherwise survive a rescan.
@@ -1234,16 +1300,17 @@ $script:AeroResources
     $apps = @($script:AppManifest)
 
     $win.FindName('BtnProceed').Add_Click({
-        $installs = @(); $uninstalls = @(); $unchanged = 0
+        $installs = @(); $uninstalls = @(); $repairs = @(); $unchanged = 0
         foreach ($app in $apps) {
             $want = [bool]$checkboxes[$app.Name].IsChecked
             $have = [bool]$baseline[$app.Name]
             if ($want -and -not $have)      { $installs   += $app.Name }
             elseif (-not $want -and $have)  { $uninstalls += $app.Name }
+            elseif ($want -and $have -and $wrenchQueue[$app.Name]) { $repairs += $app.Name }
             else                            { $unchanged++ }
         }
-        if ($installs.Count -eq 0 -and $uninstalls.Count -eq 0) {
-            [void](Show-AeroDialog -Title 'Nothing to do' -Buttons OK -Owner $win -Message "Every checkbox already matches this machine's current state -- no installs or uninstalls are queued. Change a checkbox first.")
+        if ($installs.Count -eq 0 -and $uninstalls.Count -eq 0 -and $repairs.Count -eq 0) {
+            [void](Show-AeroDialog -Title 'Nothing to do' -Buttons OK -Owner $win -Message "Every checkbox already matches this machine's current state and nothing is queued. Change a checkbox, or click an installed row's wrench to repair it with the vendor's own installer.")
             return
         }
 
@@ -1256,12 +1323,15 @@ $script:AeroResources
             }
         }
 
-        $planNames = @($installs + $uninstalls)
+        $planNames = @($installs + $uninstalls + $repairs)
         $shareNames = @()
         $odtCached = Test-Path -LiteralPath (Join-Path $env:ProgramData 'RWW\AppsDeploy\Stage\odt-setup.exe')
         foreach ($app in $apps) {
             if ($app.Name -notin $planNames) { continue }
-            $action = if ($app.Name -in $installs) { 'Install' } else { 'Uninstall' }
+            # A repair runs the app's INSTALL method again, so it shares
+            # the install spec's share needs (an Office repair pulls the
+            # ODT from the share like an install does).
+            $action = if ($app.Name -in $uninstalls) { 'Uninstall' } else { 'Install' }
             $spec = $app[$action]
             if (-not ($spec -is [hashtable] -and ($spec.Engine -eq 'Odt' -or $spec.NeedsShare))) { continue }
             # ODT uninstalls run from the locally cached setup.exe when
@@ -1279,21 +1349,30 @@ $script:AeroResources
         # PCs') gets an explicit confirm; No backs out untouched so the
         # tech can pick the right one.
         foreach ($app in $apps) {
-            if ($app.Name -in $installs -and $app.ContainsKey('Variants') -and $app.Variants.WarnOnDefault) {
+            if (($app.Name -in $installs -or $app.Name -in $repairs) -and $app.ContainsKey('Variants') -and $app.Variants.WarnOnDefault) {
                 $sel = [string]$variantSelections[$app.Name]
                 if ($sel -eq [string]$app.Variants.Default) {
-                    $q = "$($app.Name) is about to install with the DEFAULT $($app.Variants.Label): '$sel'.`n`nIs that the right $($app.Variants.Label) for this machine? (No returns to the menu so you can pick a different one.)"
+                    $actWord = if ($app.Name -in $repairs) { 'repair (reinstall)' } else { 'install' }
+                    $q = "$($app.Name) is about to $actWord with the DEFAULT $($app.Variants.Label): '$sel'.`n`nIs that the right $($app.Variants.Label) for this machine? (No returns to the menu so you can pick a different one.)"
                     if (-not (Show-AeroDialog -Title ('Default {0} selected' -f $app.Variants.Label) -Owner $win -Message $q)) { return }
                 }
             }
         }
 
         $installsDisplay = @(foreach ($n in $installs) {
+            $d = if ($variantSelections.ContainsKey($n)) { '{0} ({1})' -f $n, $variantSelections[$n] } else { $n }
+            if ($wrenchQueue[$n]) { $d + ' [vendor window]' } else { $d }
+        })
+        $uninstallsDisplay = @(foreach ($n in $uninstalls) {
+            if ($wrenchQueue[$n]) { $n + ' [vendor window]' } else { $n }
+        })
+        $repairsDisplay = @(foreach ($n in $repairs) {
             if ($variantSelections.ContainsKey($n)) { '{0} ({1})' -f $n, $variantSelections[$n] } else { $n }
         })
         $msg = "The following changes will be made:`n"
         if ($installs.Count   -gt 0) { $msg += "`nINSTALL:   " + ($installsDisplay -join ', ') }
-        if ($uninstalls.Count -gt 0) { $msg += "`nUNINSTALL: " + ($uninstalls -join ', ') }
+        if ($uninstalls.Count -gt 0) { $msg += "`nUNINSTALL: " + ($uninstallsDisplay -join ', ') }
+        if ($repairs.Count    -gt 0) { $msg += "`nREPAIR:    " + ($repairsDisplay -join ', ') + ' (vendor window)' }
         $msg += "`n`nUnchanged: $unchanged app(s)."
         if ($shareNames.Count -gt 0) { $msg += "`n`nUses the installer share (may ask for credentials): " + ($shareNames -join ', ') }
         $msg += "`n`nProceed?"
@@ -1306,17 +1385,31 @@ $script:AeroResources
         # menu could not discover before credentials existed.
         if ($shareNames.Count -gt 0) { & $refreshVariants }
 
+        # Interactivity rides per step now (the row's wrench), not as a
+        # global job flag: a lit wrench on a pending change makes THAT
+        # install/uninstall show its vendor window; a repair exists only
+        # via the wrench, so repairs are always interactive here.
         $steps = @()
-        foreach ($n in $uninstalls) { $steps += @{ Name = $n; Action = 'Uninstall' } }
+        foreach ($n in $uninstalls) {
+            $step = @{ Name = $n; Action = 'Uninstall' }
+            if ($wrenchQueue[$n]) { $step.Interactive = $true }
+            $steps += $step
+        }
         foreach ($n in $installs) {
             $step = @{ Name = $n; Action = 'Install' }
+            if ($variantSelections.ContainsKey($n)) { $step.Variant = $variantSelections[$n] }
+            if ($wrenchQueue[$n]) { $step.Interactive = $true }
+            $steps += $step
+        }
+        foreach ($n in $repairs) {
+            $step = @{ Name = $n; Action = 'Repair'; Interactive = $true }
             if ($variantSelections.ContainsKey($n)) { $step.Variant = $variantSelections[$n] }
             $steps += $step
         }
 
         $idleTimer.Stop()
         $idleText.Text = ''
-        $outcome = Show-ProgressWindow -Plan $steps -Interactive ([bool]$toggle.IsChecked) -OwnerWindow $win
+        $outcome = Show-ProgressWindow -Plan $steps -OwnerWindow $win
         if ($outcome -eq 'repeat') {
             & $rescan   # the world changed; reflect it before the next pass
             & $refreshVariants
@@ -1347,7 +1440,7 @@ $script:AeroResources
         foreach ($n in $targets) { $steps += @{ Name = $n; Action = 'Update' } }
         $idleTimer.Stop()
         $idleText.Text = ''
-        $outcome = Show-ProgressWindow -Plan $steps -Interactive ([bool]$toggle.IsChecked) -OwnerWindow $win
+        $outcome = Show-ProgressWindow -Plan $steps -OwnerWindow $win
         if ($outcome -eq 'repeat') {
             & $rescan
             & $refreshVariants
@@ -1496,7 +1589,7 @@ function Invoke-ConsoleRun {
             for ($k = 0; $k -lt $parts.Count - 1; $k++) {
                 $line = $parts[$k]
                 if (-not $line) { continue }
-                if ($line -match '^::STEP::(\d+)/(\d+)::(.+?)::(Install|Uninstall|Update)$') {
+                if ($line -match '^::STEP::(\d+)/(\d+)::(.+?)::(Install|Uninstall|Update|Repair)$') {
                     Write-Con ("--- Step {0} of {1}: {2} {3} ---" -f $Matches[1], $Matches[2], $Matches[4], $Matches[3]) White
                     continue
                 }
@@ -1529,7 +1622,7 @@ function Show-ConsoleMenu {
     Write-Con "This desktop cannot display the normal windows, so here is the same tool as a text menu." DarkGray
 
     $apps = @($script:AppManifest)
-    $baseline = @{}; $selected = @{}; $variantSel = @{}
+    $baseline = @{}; $selected = @{}; $variantSel = @{}; $repairSel = @{}
     foreach ($app in $apps) {
         if ($app.ContainsKey('Variants')) { $variantSel[$app.Name] = [string]$app.Variants.Default }
     }
@@ -1551,6 +1644,7 @@ function Show-ConsoleMenu {
             try { $inst = [bool](& $app.Detect) } catch {}
             $baseline[$app.Name] = $inst
             $selected[$app.Name] = $inst
+            $repairSel[$app.Name] = $false
         }
     }
     & $rescanState
@@ -1573,10 +1667,12 @@ function Show-ConsoleMenu {
             $col = [ConsoleColor]::Gray
             if ($selected[$app.Name] -and -not $baseline[$app.Name]) { $pend = '  << will be INSTALLED'; $col = [ConsoleColor]::Green }
             elseif (-not $selected[$app.Name] -and $baseline[$app.Name]) { $pend = '  << will be UNINSTALLED'; $col = [ConsoleColor]::Yellow }
+            elseif ($repairSel[$app.Name]) { $pend = '  << will be REPAIRED'; $col = [ConsoleColor]::Cyan }
             Write-Con ("  {0,3}. {1} {2} {3}{4}{5}" -f $i, $mark, $app.Name, $state, $extra, $pend) $col
         }
         Write-Con ""
         Write-Con "  Toggle: numbers (e.g. 3 or 3,7,12) | V <num> = choose an app's option (e.g. Automate site)" DarkGray
+        Write-Con "  E <num> = queue a repair (re-run an installed app's installer)" DarkGray
         Write-Con "  F = apply a profile | R = rescan | P = proceed | Q = quit" DarkGray
         $cmd = (Read-Host 'Command').Trim()
 
@@ -1595,6 +1691,15 @@ function Show-ConsoleMenu {
                 }
                 if ($unknown.Count -gt 0) { Write-Con ("  Profile names not in the manifest: " + ($unknown -join ', ')) Yellow }
             }
+            continue
+        }
+        elseif ($cmd -match '^[Ee]\s*(\d+)$') {
+            $n = [int]$Matches[1]
+            if ($n -lt 1 -or $n -gt $ordered.Count) { Write-Con "  No such entry." Yellow; continue }
+            $name = $ordered[$n - 1].Name
+            if (-not $baseline[$name]) { Write-Con "  $name is not installed -- there is nothing to repair (toggle it to install instead)." Yellow; continue }
+            if (-not $selected[$name]) { Write-Con "  $name is set to be UNINSTALLED -- toggle it back on first if you meant to repair it." Yellow; continue }
+            $repairSel[$name] = -not $repairSel[$name]
             continue
         }
         elseif ($cmd -match '^[Vv]\s*(\d+)$') {
@@ -1616,40 +1721,47 @@ function Show-ConsoleMenu {
                 if ($n -ge 1 -and $n -le $ordered.Count) {
                     $name = $ordered[$n - 1].Name
                     $selected[$name] = -not $selected[$name]
+                    # Turning a row into an uninstall clears any queued
+                    # repair -- the two are mutually exclusive.
+                    if (-not $selected[$name]) { $repairSel[$name] = $false }
                 }
             }
             continue
         }
         elseif ($cmd -match '^[Pp]$') {
-            $installs = @(); $uninstalls = @()
+            $installs = @(); $uninstalls = @(); $repairs = @()
             foreach ($app in $ordered) {
                 $want = [bool]$selected[$app.Name]; $have = [bool]$baseline[$app.Name]
                 if ($want -and -not $have) { $installs += $app.Name }
                 elseif (-not $want -and $have) { $uninstalls += $app.Name }
+                elseif ($want -and $have -and $repairSel[$app.Name]) { $repairs += $app.Name }
             }
-            if ($installs.Count -eq 0 -and $uninstalls.Count -eq 0) {
-                Write-Con "  Nothing to do -- every selection already matches this machine." Yellow
+            if ($installs.Count -eq 0 -and $uninstalls.Count -eq 0 -and $repairs.Count -eq 0) {
+                Write-Con "  Nothing to do -- every selection already matches this machine and no repairs are queued." Yellow
                 continue
             }
             $abort = $false
             foreach ($app in $ordered) {
-                if ($app.Name -in $installs -and $app.ContainsKey('Variants') -and $app.Variants.WarnOnDefault -and
+                if (($app.Name -in $installs -or $app.Name -in $repairs) -and $app.ContainsKey('Variants') -and $app.Variants.WarnOnDefault -and
                     [string]$variantSel[$app.Name] -eq [string]$app.Variants.Default) {
-                    $ans = Read-Host ("  {0} will install with the DEFAULT {1} '{2}'. Is that right? (y/N)" -f $app.Name, $app.Variants.Label, $variantSel[$app.Name])
+                    $actWord = if ($app.Name -in $repairs) { 'repair (reinstall)' } else { 'install' }
+                    $ans = Read-Host ("  {0} will {1} with the DEFAULT {2} '{3}'. Is that right? (y/N)" -f $app.Name, $actWord, $app.Variants.Label, $variantSel[$app.Name])
                     if ($ans -notmatch '^[Yy]') { $abort = $true; break }
                 }
             }
             if ($abort) { continue }
             if ($installs.Count -gt 0)   { Write-Con ("  INSTALL:   " + ($installs -join ', ')) Green }
             if ($uninstalls.Count -gt 0) { Write-Con ("  UNINSTALL: " + ($uninstalls -join ', ')) Yellow }
+            if ($repairs.Count -gt 0)    { Write-Con ("  REPAIR:    " + ($repairs -join ', ')) Cyan }
             $ans = Read-Host '  Proceed? (y/N)'
             if ($ans -notmatch '^[Yy]') { continue }
 
             $needShare = $false
             $odtCached = Test-Path -LiteralPath (Join-Path $env:ProgramData 'RWW\AppsDeploy\Stage\odt-setup.exe')
             foreach ($app in $ordered) {
-                if ($app.Name -notin @($installs + $uninstalls)) { continue }
-                $action = if ($app.Name -in $installs) { 'Install' } else { 'Uninstall' }
+                if ($app.Name -notin @($installs + $uninstalls + $repairs)) { continue }
+                # Repairs re-run the INSTALL spec, so they share its needs.
+                $action = if ($app.Name -in $uninstalls) { 'Uninstall' } else { 'Install' }
                 $spec = $app[$action]
                 if (-not ($spec -is [hashtable] -and ($spec.Engine -eq 'Odt' -or $spec.NeedsShare))) { continue }
                 if ($action -eq 'Uninstall' -and $spec.Engine -eq 'Odt' -and $odtCached) { continue }
@@ -1663,6 +1775,11 @@ function Show-ConsoleMenu {
             foreach ($n2 in $uninstalls) { $steps += @{ Name = $n2; Action = 'Uninstall' } }
             foreach ($n2 in $installs) {
                 $step = @{ Name = $n2; Action = 'Install' }
+                if ($variantSel.ContainsKey($n2)) { $step.Variant = $variantSel[$n2] }
+                $steps += $step
+            }
+            foreach ($n2 in $repairs) {
+                $step = @{ Name = $n2; Action = 'Repair' }
                 if ($variantSel.ContainsKey($n2)) { $step.Variant = $variantSel[$n2] }
                 $steps += $step
             }

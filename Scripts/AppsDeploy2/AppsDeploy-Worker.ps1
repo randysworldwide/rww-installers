@@ -21,7 +21,7 @@
     LOG PROTOCOL (one line per event):
       [yyyy-MM-dd HH:mm:ss] [LEVEL] message
         LEVEL: INFO, WARN, ERROR, SUCCESS, CMD
-      ::STEP::<i>/<n>::<app name>::<Install|Uninstall|Update>   (machine line)
+      ::STEP::<i>/<n>::<app name>::<Install|Uninstall|Update|Repair>   (machine line)
       ::RESULT::<app name>::<OK|FAILED>                  (machine line)
       ::DONE::<overall exit code>                        (machine line)
     Machine lines (::) drive the UI's header/status; they are not
@@ -40,6 +40,10 @@
 .PARAMETER JobFile
     JSON job plan written by the UI:
       { "Interactive": false, "Steps": [ {"Name":"...","Action":"Install"} ] }
+    A step may carry "Interactive": true (the row's wrench in the GUI),
+    which shows the vendor's own installer window for THAT step; the
+    top-level flag still forces every step interactive (kept for jobs
+    written by hand or by older front-ends).
 
 .PARAMETER CleanupApp
     Cancel-sweep mode: best-effort uninstall of ONE app, used by the UI
@@ -369,7 +373,7 @@ function Invoke-EngineSpec {
                 Write-Log "winget.exe could not be located$ctxNote." 'ERROR'
                 return
             }
-            $verb = switch ($Action) { 'Install' { 'install' } 'Update' { 'upgrade' } default { 'uninstall' } }
+            $verb = switch ($Action) { 'Install' { 'install' } 'Repair' { 'install' } 'Update' { 'upgrade' } default { 'uninstall' } }
             $mode = if ($Interactive) { '--interactive' } else { '--silent' }
             $wgArgs = @($verb, '--id', $Spec.Id, '-e', $mode, '--accept-source-agreements', '--disable-interactivity')
             if ($Action -eq 'Update') {
@@ -377,8 +381,14 @@ function Invoke-EngineSpec {
                 # cannot read the installed version from ARP.
                 $wgArgs += @('--accept-package-agreements', '--include-unknown')
             }
-            if ($Action -eq 'Install') {
+            if ($Action -in @('Install', 'Repair')) {
                 $wgArgs += @('--accept-package-agreements', '--source', 'winget')
+                if ($Action -eq 'Repair') {
+                    # Without --force, winget sees the app is already
+                    # installed and does nothing -- the whole point of a
+                    # repair is to run the installer again anyway.
+                    $wgArgs += '--force'
+                }
                 # Machine scope by default; a manifest entry can opt out
                 # with MachineScope = $false. MSIX/Store-packaged apps
                 # (e.g. Windows Terminal) have no machine-wide installer
@@ -595,6 +605,7 @@ function Invoke-EngineSpec {
                 StageDir    = $StageRoot
                 Log         = ${function:Write-Log}
                 Variant     = $Variant
+                Action      = $Action   # 'Repair' re-runs an Install script; scripts may branch on this if they ever need to
             }
             try { & $Spec.Script $context } catch {
                 Write-Log "Custom action threw: $($_.Exception.Message)" 'ERROR'
@@ -618,6 +629,14 @@ function Invoke-AppAction {
         if ($App.ContainsKey('Update')) { $App.Update }
         elseif ($App.Install -and $App.Install.Engine -eq 'Winget') { @{ Engine = 'Winget'; Id = $App.Install.Id } }
         else { $null }
+    } elseif ($Action -eq 'Repair') {
+        # Repair = re-run the app's INSTALL method over the existing
+        # install, skipping the already-installed shortcut. Reinstalling
+        # over the top is the standard repair for MSI-based installers;
+        # winget gets --force; ODT re-running its Add config makes
+        # Click-to-Run restore itself. An explicit Repair spec in the
+        # manifest wins if an app ever needs something different.
+        if ($App.ContainsKey('Repair')) { $App.Repair } else { $App.Install }
     } else { $App[$Action] }
     if (-not $spec) {
         Write-Log "$($App.Name) has no $Action action defined in the manifest." 'ERROR'
@@ -627,7 +646,7 @@ function Invoke-AppAction {
     Invoke-EngineSpec -App $App -Spec $spec -Action $Action -Interactive $Interactive -Variant $Variant
 
 
-    if ($Action -in @('Uninstall', 'Update')) { Restore-ExplorerIfKilled }
+    if ($Action -in @('Uninstall', 'Update', 'Repair')) { Restore-ExplorerIfKilled }
 
     # --- Verification: detection is the ground truth ---
     $nowPresent = [bool](& $App.Detect)
@@ -652,6 +671,7 @@ function Invoke-AppAction {
         $why = switch ($Action) {
             'Install'   { 'the app is still NOT installed after the install attempt above' }
             'Update'    { 'the app is NO LONGER detected after the update attempt above (the update may have removed or broken it)' }
+            'Repair'    { 'the app is NO LONGER detected after the repair attempt above (the repair may have removed or broken it)' }
             default     { 'the app is STILL installed after the uninstall attempt above' }
         }
         Write-Log "$($App.Name) ${Action} FAILED: $why -- detection is the ground truth here, whatever the exit codes said." 'ERROR'
@@ -671,11 +691,25 @@ if ($CleanupApp) {
     $app = Get-App -Name $CleanupApp
     if ($app) {
         if ($CleanupAction -eq 'Install') {
-            # A cancelled UPDATE cannot be undone -- repair by reinstall.
+            # A cancelled UPDATE or REPAIR cannot be undone -- repair by
+            # reinstall. For an Office product, stop Click-to-Run's
+            # in-flight scenario FIRST: the service keeps working after
+            # setup.exe dies, and a leftover scenario lock would make the
+            # reinstall below wait forever.
+            if ($app.Install -is [hashtable] -and $app.Install.Engine -eq 'Odt') {
+                Write-Log "Stopping the Office Click-to-Run service's in-flight work before the repair reinstall..." 'WARN'
+                try { Stop-Service -Name 'ClickToRunSvc' -Force -ErrorAction SilentlyContinue } catch {}
+                foreach ($pname in @('OfficeClickToRun', 'OfficeC2RClient')) {
+                    Get-Process -Name $pname -ErrorAction SilentlyContinue | ForEach-Object {
+                        try { & taskkill.exe /PID $_.Id /T /F 2>$null | Out-Null } catch {}
+                    }
+                }
+                Start-Sleep -Seconds 3
+            }
             if (& $app.Detect) {
-                Write-Log "'$CleanupApp' is still detected after the interrupted update -- re-running its installer to make sure it is healthy."
+                Write-Log "'$CleanupApp' is still detected after the interrupted update/repair -- re-running its installer to make sure it is healthy."
             } else {
-                Write-Log "'$CleanupApp' is missing after the interrupted update -- reinstalling it." 'WARN'
+                Write-Log "'$CleanupApp' is missing after the interrupted update/repair -- reinstalling it." 'WARN'
             }
             [void](Invoke-AppAction -App $app -Action 'Install' -Interactive:$false)
         } elseif ($app.Uninstall -is [hashtable] -and $app.Uninstall.Engine -eq 'Odt') {
@@ -716,8 +750,8 @@ $steps = @($job.Steps)
 $interactive = [bool]$job.Interactive
 
 Write-Log "=== AppsDeploy run starting on $env:COMPUTERNAME as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) ==="
-Write-Log ("Plan: " + (($steps | ForEach-Object { "$($_.Action) $($_.Name)" }) -join '; '))
-if ($interactive) { Write-Log "Interactive mode is ON -- installer UIs will be shown instead of running silently." 'WARN' }
+Write-Log ("Plan: " + (($steps | ForEach-Object { "$($_.Action) $($_.Name)$(if ($_.Interactive) { ' (interactive)' })" }) -join '; '))
+if ($interactive) { Write-Log "Interactive mode is ON for the whole job -- installer UIs will be shown instead of running silently." 'WARN' }
 
 $anyFailed = $false
 $i = 0
@@ -752,8 +786,20 @@ foreach ($step in $steps) {
         Write-Machine "::RESULT::$($step.Name)::OK"
         continue
     }
+    if ($step.Action -eq 'Repair' -and -not $present) {
+        # A repair deliberately has NO already-in-desired-state skip --
+        # running the installer again is the whole point. If the app
+        # vanished since the scan, the repair simply installs it fresh.
+        Write-Log "$($app.Name) is not currently detected -- the repair will install it fresh." 'WARN'
+    }
 
-    $ok = Invoke-AppAction -App $app -Action $step.Action -Interactive:$interactive -Variant ([string]$step.Variant)
+    # Interactivity is per step (the GUI row's wrench); the job-wide
+    # flag still wins when set.
+    $stepInteractive = $interactive -or [bool]$step.Interactive
+    if ($stepInteractive -and -not $interactive) {
+        Write-Log "This step runs INTERACTIVE -- the vendor's own installer window will be shown." 'WARN'
+    }
+    $ok = Invoke-AppAction -App $app -Action $step.Action -Interactive:$stepInteractive -Variant ([string]$step.Variant)
     Write-Machine "::RESULT::$($step.Name)::$(if ($ok) { 'OK' } else { 'FAILED' })"
     if (-not $ok) { $anyFailed = $true }
 }

@@ -248,8 +248,16 @@ $script:AppManifest = @(
             $winget = Resolve-WinGet
             if (-not $winget) { & $Context.Log 'winget.exe could not be located.' 'ERROR'; return }
             $mode = if ($Context.Interactive) { '--interactive' } else { '--silent --disable-interactivity' }
+            # A Repair re-runs this script over an existing install:
+            # winget needs --force or it no-ops with 'already installed'.
+            if ($Context.Action -eq 'Repair') { $mode = "--force $mode" }
             $code = Invoke-ProcessStep -FilePath $winget -Arguments "install --id Microsoft.WindowsTerminal -e $mode --accept-source-agreements --accept-package-agreements --source winget"
             if ($null -ne $code) { & $Context.Log "winget exit code: $code" }
+            # The auto-launch kill watch runs ONLY on a true install: the
+            # only-safe-because-absent reasoning in the header does not
+            # hold for a Repair, where a Terminal process could be a
+            # tech's own live session.
+            if ($Context.Action -eq 'Repair') { return }
             $deadline = (Get-Date).AddSeconds(15)
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds 2
@@ -407,6 +415,9 @@ $script:AppManifest = @(
             $winget = Resolve-WinGet
             if (-not $winget) { & $Context.Log 'winget.exe could not be located.' 'ERROR'; return }
             $mode = if ($Context.Interactive) { '--interactive' } else { '--silent --disable-interactivity' }
+            # Repair: --force makes winget reinstall each redist instead
+            # of no-opping on 'already installed'.
+            if ($Context.Action -eq 'Repair') { $mode = "--force $mode" }
             $ids = @('Microsoft.VCRedist.2010.x64', 'Microsoft.VCRedist.2010.x86',
                      'Microsoft.VCRedist.2012.x64', 'Microsoft.VCRedist.2012.x86',
                      'Microsoft.VCRedist.2013.x64', 'Microsoft.VCRedist.2013.x86',
@@ -528,7 +539,15 @@ $script:AppManifest = @(
             try {
                 Add-AppxProvisionedPackage -Online -PackagePath $msix -SkipLicense -Regions 'all' | Out-Null
             } catch {
-                & $Context.Log "Provisioning failed: $($_.Exception.Message)" 'ERROR'
+                if ($Context.Action -eq 'Repair') {
+                    # Claude self-updates, so a repair's freshly
+                    # downloaded MSIX is often the SAME version already
+                    # provisioned -- Windows refuses that re-provision.
+                    # Not a failure: the package is present and current.
+                    & $Context.Log "Re-provisioning was refused -- Claude is already provisioned at this version (it self-updates): $($_.Exception.Message)" 'WARN'
+                } else {
+                    & $Context.Log "Provisioning failed: $($_.Exception.Message)" 'ERROR'
+                }
             }
             Remove-Item -LiteralPath $msix -Force -ErrorAction SilentlyContinue
         } }
