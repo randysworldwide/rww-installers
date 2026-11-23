@@ -122,8 +122,236 @@ function Get-WingetErrorHint {
 }
 
 # winget codes that indicate a SOURCE problem rather than an app problem
-# -- worth an automatic 'winget source update' and one retry.
+# -- worth an automatic 'winget source update' and one retry, then a
+# one-time 'winget source reset --force' escalation (the documented fix
+# for a machine-wide 0x8A15000F; confirmed needed on WSWA1ITG070).
 $script:WingetSourceErrorCodes = @(-1978335217, -1978335221, -1978335211)
+
+# winget codes that mean NOTHING ran -- no installer was ever launched.
+# For Install/Uninstall, detection catches these on its own. For UPDATE
+# they matter: detection can only see 'still installed', which is true
+# whether or not an update happened, so these codes are the only honest
+# failure signal (confirmed on WSWA1ITG070: a fully broken winget
+# produced an all-green 12-app update run).
+$script:WingetNothingRanCodes = @(
+    -1978335217, -1978335221, -1978335211,   # source data missing / invalid / none defined
+    -1978335224,                              # download failed
+    -1978335215,                              # installer hash mismatch (refused to run it)
+    -1978335216,                              # no applicable installer
+    -1978335212                               # no matching package found
+)
+
+# Set $true when even a source reset could not revive winget: every
+# later winget step this run is skipped instead of burning three
+# attempts each.
+$script:WingetSourceDead = $false
+# Why winget was declared dead, shown on every skipped step.
+$script:WingetDeadReason = 'every self-heal attempt earlier in this run failed. See the first failed step above for the root-cause check; this machine needs hands-on diagnosis.'
+
+function Get-InteractiveUser {
+    # The user signed in at the console (DOMAIN\name), or $null when
+    # nobody is (or it cannot be determined).
+    try { return [string](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { return $null }
+}
+# The final winget exit code of the most recent Winget engine step.
+$script:LastWingetCode = $null
+# Log the winget client version once per run (first winget step), so a
+# stale client is visible in every log without the tech checking.
+$script:WingetVersionLogged = $false
+
+function Clear-WingetSourceCache {
+    # The 'winget' source is not just a list entry: its DATA is a
+    # per-user MSIX package (Microsoft.Winget.Source) plus cache folders
+    # under the App Installer package's own app data. 'winget source
+    # reset' rewrites the source LIST but never touches that cached
+    # data, and reinstalling the same App Installer version does not
+    # clear package data either -- which is exactly how a corrupted
+    # cache survives both (CONFIRMED on WSWA1ITG070: 0x8A15000F through
+    # a reset AND a client reinstall). Removing the package and the
+    # cache folders forces winget to re-download the source from
+    # scratch on the next 'source update'.
+    Write-Log "Purging winget's cached source data so it re-downloads from scratch..." 'WARN'
+    $srcPkg = @(Get-AppxPackage -Name 'Microsoft.Winget.Source' -ErrorAction SilentlyContinue)
+    if ($srcPkg.Count -gt 0) {
+        Write-Log ("Removing the cached source package (Microsoft.Winget.Source {0})..." -f $srcPkg[0].Version)
+        try { $srcPkg | Remove-AppxPackage -ErrorAction SilentlyContinue } catch {}
+    } else {
+        # Not conclusive by itself: older winget kept the index as this
+        # package, newer clients keep it inside App Installer's app data
+        # (which the folder purge below clears either way).
+        Write-Log "The Microsoft.Winget.Source package is not present (newer winget versions keep the index in App Installer's app data instead -- the folder purge below covers that)."
+    }
+    foreach ($sub in @('LocalState', 'LocalCache', 'TempState')) {
+        $p = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\$sub"
+        if (Test-Path -LiteralPath $p) {
+            # Keep score on purpose: deletions that fail silently would
+            # hide the broken-permissions case, where winget cannot
+            # write its own cache ('source update' says Done, nothing
+            # lands, reads find 'data missing').
+            $gone = 0; $stuck = 0
+            foreach ($it in @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue)) {
+                try { Remove-Item -LiteralPath $it.FullName -Recurse -Force -ErrorAction Stop; $gone++ }
+                catch { $stuck++ }
+            }
+            if ($stuck -gt 0) {
+                Write-Log ("  {0}: removed {1} item(s), but {2} COULD NOT be removed (locked or access denied). Broken permissions here would explain winget failing to keep its cache -- the App Installer package reset rebuilds these folders." -f $sub, $gone, $stuck) 'WARN'
+            } else {
+                Write-Log ("  {0}: removed {1} item(s)." -f $sub, $gone)
+            }
+        }
+    }
+    $tw = Join-Path $env:TEMP 'WinGet'
+    if (Test-Path -LiteralPath $tw) {
+        try { Remove-Item -LiteralPath $tw -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Get-WingetServedVersion {
+    # What App Installer version does this URL actually serve? The
+    # download links redirect to an asset URL that carries the release
+    # tag -- follow the redirects WITHOUT downloading and read the tag,
+    # so a ~200 MB download can be skipped when it would change nothing
+    # (CONFIRMED: the bundle 'installed' in one second and the version
+    # did not move, because the served version was already installed).
+    param([string]$Url)
+    for ($hop = 0; $hop -lt 6; $hop++) {
+        if ($Url -match '[/_]v(\d+(\.\d+){1,3})[/_]') { return $Matches[1] }
+        try {
+            $rq = [System.Net.HttpWebRequest]::Create($Url)
+            $rq.Method = 'HEAD'
+            $rq.AllowAutoRedirect = $false
+            $rq.UserAgent = 'RWW-AppsDeploy/2'
+            $rs = $rq.GetResponse()
+            try { $loc = $rs.Headers['Location'] } finally { $rs.Close() }
+        } catch { return $null }
+        if (-not $loc) { return $null }
+        $Url = (New-Object System.Uri((New-Object System.Uri($Url)), $loc)).AbsoluteUri
+    }
+    return $null
+}
+
+function Test-WingetCdn {
+    # The decisive verdict when every self-heal rung has failed: fetch
+    # the source index DIRECTLY from winget's CDN and look at what
+    # actually comes back. A real index is an MSIX package (a ZIP, so
+    # the first two bytes are 'PK'); a web filter or SSL-inspection
+    # appliance that intercepts the URL returns HTML, an error page, or
+    # an empty body -- which winget writes out and then cannot read:
+    # 'Data required by the source is missing'.
+    foreach ($u in @('https://cdn.winget.microsoft.com/cache/source2.msix',
+                     'https://cdn.winget.microsoft.com/cache/source.msix')) {
+        try {
+            $rq = [System.Net.HttpWebRequest]::Create($u)
+            $rq.UserAgent = 'winget-cli'
+            $rq.Timeout = 15000
+            $rs = $rq.GetResponse()
+            try {
+                $len = $rs.ContentLength
+                $ct = [string]$rs.ContentType
+                $st = $rs.GetResponseStream()
+                $buf = New-Object byte[] 2
+                $n = $st.Read($buf, 0, 2)
+                $sig = if ($n -eq 2) { [System.Text.Encoding]::ASCII.GetString($buf) } else { '' }
+            } finally { $rs.Close() }
+            if ($sig -eq 'PK') {
+                Write-Log ("Direct check of {0}: a real package came back (PK signature, {1:N1} MB, '{2}') -- the CDN is reachable and serving valid data, so the problem is on this machine, not the network. Next: Settings > Apps > App Installer > Advanced options > RESET, or check HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller for policies." -f $u, ($len / 1MB), $ct) 'WARN'
+            } else {
+                Write-Log ("Direct check of {0}: did NOT get a package back (first bytes '{1}', content-type '{2}', length {3}) -- something on the network is intercepting or rewriting winget's index downloads. THAT is the root cause: check the firewall/web filter/SSL inspection for cdn.winget.microsoft.com." -f $u, $sig, $ct, $len) 'ERROR'
+            }
+            return
+        } catch {
+            Write-Log ("Direct check of {0} failed outright: {1}" -f $u, $_.Exception.Message) 'WARN'
+        }
+    }
+    Write-Log "Neither source index URL on cdn.winget.microsoft.com could be fetched at all -- the CDN is being blocked on this network. THAT is the root cause: allow cdn.winget.microsoft.com through the firewall/web filter." 'ERROR'
+}
+
+function Repair-WingetClient {
+    # Last self-heal rung: the sources were reset AND their cached data
+    # purged, yet winget still cannot read them -- update the winget
+    # CLIENT (the App Installer package) itself. Returns $true when an
+    # update actually landed and a retry is worth making.
+    param([string]$InstalledVersion)
+    if (Test-IsSystem) {
+        Write-Log "Running as SYSTEM -- the App Installer package cannot be updated from this context." 'WARN'
+        return $false
+    }
+    # Two places serve the client bundle, and they are NOT in sync:
+    # GitHub's 'latest' release alias is often a release ahead of
+    # aka.ms/getwinget (CONFIRMED: aka.ms served the already-installed
+    # v1.29.290 while a newer stable existed). A source index that has
+    # moved ahead of the installed client is the classic persistent
+    # 0x8A15000F, so check BOTH and take the newest. Skip the ~200 MB
+    # download when nothing newer is served -- reinstalling the same
+    # version is a one-second no-op that fixes nothing.
+    $instV = $null
+    if ($InstalledVersion -match '(\d+(\.\d+){1,3})') { try { $instV = [version]$Matches[1] } catch {} }
+    # Cheapest fix first, before any download: MSIX registrations are
+    # PER-USER, so a newer App Installer can already be staged on the
+    # machine without being registered for THIS user (CONFIRMED on
+    # WSWA1ITG070: one profile ran a 1.30 preview that worked while the
+    # tool's profile was registered at 1.29 and broken). Registering the
+    # staged package costs one command and no download.
+    try {
+        $staged = @(Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Version } -Descending)
+        if ($staged.Count -gt 0 -and $instV -and ([version]$staged[0].Version) -gt $instV) {
+            Write-Log ("A newer App Installer (v{0}) is already staged on this machine but not registered for this user (running v{1}) -- registering the staged one." -f $staged[0].Version, $instV) 'WARN'
+            Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop
+            Write-Log "Registered the staged App Installer for this user."
+            return $true
+        }
+    } catch {
+        Write-Log "Could not register the staged App Installer: $($_.Exception.Message)" 'WARN'
+    }
+    $candidates = @(
+        'https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle',
+        'https://aka.ms/getwinget'
+    )
+    $bestUrl = $null; $bestVer = $null
+    foreach ($u in $candidates) {
+        $vText = Get-WingetServedVersion -Url $u
+        if (-not $vText) { continue }
+        $v = $null
+        try { $v = [version]$vText } catch {}
+        if ($v) {
+            Write-Log "Available App Installer: v$vText from $($u -replace '^https://([^/]+).*', '$1')"
+            if (-not $bestVer -or $v -gt $bestVer) { $bestVer = $v; $bestUrl = $u }
+        }
+    }
+    if ($bestVer -and $instV -and $bestVer -le $instV) {
+        Write-Log "The newest App Installer served anywhere (v$bestVer) is not newer than the installed v$instV -- the client is current, so updating it would change nothing. Skipping the download." 'WARN'
+        return $false
+    }
+    if ($bestVer) { Write-Log "Newer App Installer found: v$bestVer (installed: $InstalledVersion) -- downloading it." }
+    $dlUrl = if ($bestUrl) { $bestUrl } else { 'https://aka.ms/getwinget' }
+    # Preferred: Windows' own repair cmdlet (ships with Win11 24H2+).
+    if (Get-Command Repair-WinGetPackageManager -ErrorAction SilentlyContinue) {
+        Write-Log "Updating the winget client with Windows' built-in Repair-WinGetPackageManager..." 'WARN'
+        try {
+            Repair-WinGetPackageManager -Latest -Force -ErrorAction Stop | Out-Null
+            Write-Log "Repair-WinGetPackageManager completed."
+            return $true
+        } catch {
+            Write-Log "Repair-WinGetPackageManager failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    # Fallback: pull the newest App Installer bundle from whichever
+    # candidate served the newest version and install it for this user.
+    try {
+        if (-not (Test-Path $StageRoot)) { New-Item -Path $StageRoot -ItemType Directory -Force | Out-Null }
+        $bundle = Join-Path $StageRoot 'DesktopAppInstaller.msixbundle'
+        Invoke-LoggedDownload -Url $dlUrl -OutFile $bundle
+        Write-Log "Installing the latest App Installer package (this is what updates winget)..." 'WARN'
+        Add-AppxPackage -Path $bundle -ForceApplicationShutdown -ErrorAction Stop
+        Remove-Item -LiteralPath $bundle -Force -ErrorAction SilentlyContinue
+        Write-Log "App Installer updated."
+        return $true
+    } catch {
+        Write-Log "Could not update the App Installer package: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
 
 function Restore-ExplorerIfKilled {
     # Confirmed real behavior (7-Zip uninstall incident, RestartManager
@@ -367,11 +595,24 @@ function Invoke-EngineSpec {
     switch ($Spec.Engine) {
 
         'Winget' {
+            $script:LastWingetCode = $null
             $winget = Resolve-WinGet
             if (-not $winget) {
                 $ctxNote = if (Test-IsSystem) { " (running as SYSTEM -- winget is frequently unavailable in this context; this app may need an MSI-based engine for Backstage use)" } else { "" }
                 Write-Log "winget.exe could not be located$ctxNote." 'ERROR'
                 return
+            }
+            if ($script:WingetSourceDead) {
+                Write-Log "Skipping winget for this step: $($script:WingetDeadReason)" 'ERROR'
+                $script:LastWingetCode = -1978335217
+                return
+            }
+            if (-not $script:WingetVersionLogged) {
+                $script:WingetVersionLogged = $true
+                try {
+                    $wgv = @(& $winget --version 2>$null) | Select-Object -First 1
+                    if ($wgv) { Write-Log "winget client: $wgv" }
+                } catch {}
             }
             $verb = switch ($Action) { 'Install' { 'install' } 'Repair' { 'install' } 'Update' { 'upgrade' } default { 'uninstall' } }
             $mode = if ($Interactive) { '--interactive' } else { '--silent' }
@@ -409,9 +650,38 @@ function Invoke-EngineSpec {
                 Write-Log "Already up to date -- winget has no newer version."
             }
 
-            # Source-problem auto-recovery (CONFIRMED real case: a VLC
-            # install failed with 0x8A15000F SOURCE_DATA_MISSING): refresh
-            # the source and retry the same command once.
+            # Source-problem auto-recovery, an escalation ladder
+            # (CONFIRMED real cases: a VLC install failed with 0x8A15000F
+            # that a source update fixed; WSWA1ITG070's winget is broken
+            # machine-wide and needs the full reset):
+            #   1. 'winget source update' + retry.
+            #   2. Still a source error: 'winget source reset --force'
+            #      (restores the default sources) + one more retry.
+            #   3. STILL a source error: winget is dead on this machine
+            #      -- flag it so every later winget step this run skips
+            #      straight to a clear failure instead of retrying.
+            if ($code -in $script:WingetSourceErrorCodes -and -not (Test-IsSystem)) {
+                # Before climbing any repair rung: if this account is not
+                # the user signed in at the console, NOTHING below can
+                # help. winget's source data arrives as a per-user MSIX,
+                # and Windows refuses to register a package for an
+                # account without a logon session -- an account used
+                # only to elevate (a tech's separate admin account on a
+                # user's machine) hits AppX error 0x80073D19 'user was
+                # logged off' on every attempt (CONFIRMED on WSWA1ITG070
+                # via the AppxDeploymentServer log: astone elevating on
+                # aaron.stone's session).
+                $who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                $console = Get-InteractiveUser
+                if ($console -and $who -and ($console -ne $who)) {
+                    $script:WingetSourceDead = $true
+                    $script:WingetDeadReason = "winget cannot work for '$who' on this machine because that account is not the signed-in user ('$console') -- Windows refuses to register winget's per-user source data for an account without a logon session. This is how Windows works, not a fault to repair. Options: sign in to this machine as $who and rerun, or use the non-winget install methods (MSI/ODT/share-based apps are unaffected)."
+                    Write-Log $script:WingetDeadReason 'ERROR'
+                    $script:LastWingetCode = $code
+                    return
+                }
+            }
+
             if ($code -in $script:WingetSourceErrorCodes) {
                 Write-Log "winget's source looks stale or broken -- running 'winget source update' and retrying once." 'WARN'
                 [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source update --disable-interactivity')
@@ -419,7 +689,100 @@ function Invoke-EngineSpec {
                 if ($null -ne $code) { Write-Log "winget retry exit code: $code" }
                 $hint = if ($null -ne $code) { Get-WingetErrorHint -Code $code } else { $null }
                 if ($hint) { Write-Log "winget: $hint" 'WARN' }
+
+                if ($code -in $script:WingetSourceErrorCodes) {
+                    Write-Log "The source update did not help -- resetting winget's sources to the defaults (winget source reset --force) and retrying once more." 'WARN'
+                    [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source reset --force --disable-interactivity')
+                    [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source update --disable-interactivity')
+                    $code = Invoke-ProcessStep -FilePath $winget -Arguments ($wgArgs -join ' ')
+                    if ($null -ne $code) { Write-Log "winget post-reset exit code: $code" }
+                    $hint = if ($null -ne $code) { Get-WingetErrorHint -Code $code } else { $null }
+                    if ($hint) { Write-Log "winget: $hint" 'WARN' }
+                    if ($code -in $script:WingetSourceErrorCodes) {
+                        # Rung 3: the reset rewrote the source LIST, but
+                        # the source's cached DATA survives a reset (and
+                        # even a client reinstall) -- purge it so winget
+                        # re-downloads the source from scratch.
+                        Write-Log "The source reset did not help -- the cached source data itself is likely corrupted (a reset rewrites the list, not the data)." 'WARN'
+                        Clear-WingetSourceCache
+                        [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source update --disable-interactivity')
+                        $code = Invoke-ProcessStep -FilePath $winget -Arguments ($wgArgs -join ' ')
+                        if ($null -ne $code) { Write-Log "winget post-cache-purge exit code: $code" }
+                        $hint = if ($null -ne $code) { Get-WingetErrorHint -Code $code } else { $null }
+                        if ($hint) { Write-Log "winget: $hint" 'WARN' }
+
+                        if ($code -in $script:WingetSourceErrorCodes) {
+                            # Rung 4: update the winget CLIENT itself and
+                            # retry one last time (skipped automatically
+                            # when Microsoft is serving the version that
+                            # is already installed).
+                            Write-Log "The cache purge did not help either -- checking whether the winget client itself can be updated." 'WARN'
+                            $fixedByPkgReset = $false
+                            $curVer = $null
+                            try { $curVer = @(& $winget --version 2>$null) | Select-Object -First 1 } catch {}
+                            if (Repair-WingetClient -InstalledVersion ([string]$curVer)) {
+                                $winget = Resolve-WinGet
+                                if ($winget) {
+                                    try {
+                                        $wgv = @(& $winget --version 2>$null) | Select-Object -First 1
+                                        if ($wgv) { Write-Log "winget client is now: $wgv" }
+                                    } catch {}
+                                    [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source update --disable-interactivity')
+                                    $code = Invoke-ProcessStep -FilePath $winget -Arguments ($wgArgs -join ' ')
+                                    if ($null -ne $code) { Write-Log "winget post-client-update exit code: $code" }
+                                    $hint = if ($null -ne $code) { Get-WingetErrorHint -Code $code } else { $null }
+                                    if ($hint) { Write-Log "winget: $hint" 'WARN' }
+                                } else {
+                                    Write-Log "winget.exe could not be located after the client update." 'ERROR'
+                                }
+                            }
+                            if ($code -in $script:WingetSourceErrorCodes -and -not (Test-IsSystem) -and (Get-Command Reset-AppxPackage -ErrorAction SilentlyContinue)) {
+                                # Rung 5: reset the App Installer PACKAGE
+                                # itself -- the programmatic equivalent of
+                                # Settings > Apps > App Installer > Reset.
+                                # Its data folders persist across client
+                                # reinstalls, so broken state (or broken
+                                # permissions) there survives every rung
+                                # above; this rebuilds them from scratch.
+                                Write-Log "One more rung: resetting the App Installer package (same as Settings > Apps > App Installer > Reset -- rebuilds its data folders and their permissions from scratch)." 'WARN'
+                                try {
+                                    $dai = Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction Stop | Select-Object -First 1
+                                    if ($dai) {
+                                        Reset-AppxPackage -Package $dai.PackageFullName -ErrorAction Stop
+                                        Start-Sleep -Seconds 2
+                                        $winget = Resolve-WinGet
+                                        if ($winget) {
+                                            [void](Invoke-ProcessStep -FilePath $winget -Arguments 'source update --disable-interactivity')
+                                            $code = Invoke-ProcessStep -FilePath $winget -Arguments ($wgArgs -join ' ')
+                                            if ($null -ne $code) { Write-Log "winget post-package-reset exit code: $code" }
+                                            $hint = if ($null -ne $code) { Get-WingetErrorHint -Code $code } else { $null }
+                                            if ($hint) { Write-Log "winget: $hint" 'WARN' }
+                                        }
+                                    }
+                                } catch {
+                                    Write-Log "Reset-AppxPackage failed: $($_.Exception.Message)" 'WARN'
+                                }
+                                if ($code -notin $script:WingetSourceErrorCodes) {
+                                    $fixedByPkgReset = $true
+                                    Write-Log "Resetting the App Installer package fixed winget on this machine." 'SUCCESS'
+                                }
+                            }
+                            if ($code -in $script:WingetSourceErrorCodes) {
+                                $script:WingetSourceDead = $true
+                                Write-Log "winget is broken machine-wide on this computer -- every self-heal rung failed (source reset, cache purge, client update check, package reset where available). The remaining winget steps in this run will be skipped. Checking what winget's CDN actually serves this machine, to pin down the root cause:" 'ERROR'
+                                Test-WingetCdn
+                            } elseif (-not $fixedByPkgReset) {
+                                Write-Log "winget is healthy again after updating its client." 'SUCCESS'
+                            }
+                        } else {
+                            Write-Log "Purging the cached source data fixed winget on this machine." 'SUCCESS'
+                        }
+                    } else {
+                        Write-Log "The source reset fixed winget on this machine." 'SUCCESS'
+                    }
+                }
             }
+            $script:LastWingetCode = $code
 
         }
 
@@ -645,6 +1008,17 @@ function Invoke-AppAction {
 
     Invoke-EngineSpec -App $App -Spec $spec -Action $Action -Interactive $Interactive -Variant $Variant
 
+    # UPDATE needs more than the presence check below: detection can only
+    # see 'still installed', which is true whether or not an update
+    # happened, so a winget-level failure that never ran any installer
+    # must fail the step on its exit code (confirmed on WSWA1ITG070: a
+    # fully broken winget produced an all-green 12-app update run).
+    # Install/Uninstall stay detection-judged -- there the world visibly
+    # changes, and installer exit codes lie (Logi's 1008-on-success).
+    if ($Action -eq 'Update' -and $spec.Engine -eq 'Winget' -and $script:LastWingetCode -in $script:WingetNothingRanCodes) {
+        Write-Log "$($App.Name) Update FAILED: winget could not check or apply the update at all (see above) -- the app was left untouched, not updated." 'ERROR'
+        return $false
+    }
 
     if ($Action -in @('Uninstall', 'Update', 'Repair')) { Restore-ExplorerIfKilled }
 
