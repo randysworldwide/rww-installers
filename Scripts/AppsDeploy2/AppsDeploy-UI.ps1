@@ -1673,11 +1673,39 @@ function Show-ConsoleMenu {
         Write-Con ""
         Write-Con "  Toggle: numbers (e.g. 3 or 3,7,12) | V <num> = choose an app's option (e.g. Automate site)" DarkGray
         Write-Con "  E <num> = queue a repair (re-run an installed app's installer)" DarkGray
-        Write-Con "  F = apply a profile | R = rescan | P = proceed | Q = quit" DarkGray
+        Write-Con "  F = apply a profile | U = update all installed apps | R = rescan | P = proceed | Q = quit" DarkGray
         $cmd = (Read-Host 'Command').Trim()
 
         if ($cmd -match '^[Qq]$') { return }
         elseif ($cmd -match '^[Rr]$') { & $rescanState; continue }
+        elseif ($cmd -match '^[Uu]$') {
+            # Console twin of the GUI's 'Update installed apps' button:
+            # every installed app that is update-managed (an explicit
+            # Update spec, or a plain Winget install, which updates via
+            # 'winget upgrade' with the same Id).
+            $targets = @(); $skipped = @()
+            foreach ($app in $ordered) {
+                if (-not [bool]$baseline[$app.Name]) { continue }
+                $updatable = $app.ContainsKey('Update') -or ($app.Install -and $app.Install.Engine -eq 'Winget')
+                if ($updatable) { $targets += $app.Name } else { $skipped += $app.Name }
+            }
+            if ($targets.Count -eq 0) {
+                Write-Con "  No installed app in this menu is update-managed by this tool." Yellow
+                continue
+            }
+            Write-Con ("  UPDATE: " + ($targets -join ', ')) Green
+            if ($skipped.Count -gt 0) { Write-Con ("  Skipped (they manage their own updates or are not winget-managed): " + ($skipped -join ', ')) DarkGray }
+            if (Test-IsSystem) {
+                Write-Con "  Note: this session runs as SYSTEM, where winget is usually unavailable -- these updates will likely fail with clear messages rather than run." Yellow
+            }
+            $ans = Read-Host '  Check these for updates and apply any found? (y/N)'
+            if ($ans -notmatch '^[Yy]') { continue }
+            $steps = @()
+            foreach ($n2 in $targets) { $steps += @{ Name = $n2; Action = 'Update' } }
+            Invoke-ConsoleRun -Plan $steps
+            & $rescanState
+            continue
+        }
         elseif ($cmd -match '^[Ff]$') {
             $profiles = @($script:Profiles)
             if ($profiles.Count -eq 0) { Write-Con "  No profiles are defined." Yellow; continue }
