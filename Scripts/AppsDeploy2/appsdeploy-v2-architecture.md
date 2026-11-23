@@ -1,55 +1,112 @@
-# AppsDeploy v2 — Architecture (redesign, Nov 2026)
+# AppsDeploy v2 — How It Works and Why
 
-Sibling to the OSDCloud + Intune deployment overhaul. v2 replaces the v1 Apps-Deploy-Menu: OSDCloud owns imaging + baseline agents (S1, Automate, Cisco), Intune owns user-driven apps, and this tool becomes a stateless, run-anytime app reconciler for specialty installs — usable pre-ship, in a user's session, or via Automate Backstage (SYSTEM).
+AppsDeploy is RANDYS's tool for installing, uninstalling, and repairing workstation software. A tech checks boxes for the apps a machine should have, clicks Proceed, and the tool makes the machine match. It works on a bench machine before shipping, in a user's live session, or remotely as SYSTEM through Automate Backstage.
 
-**Status (v63, 2026-11-19): THE APP ROSTER IS COMPLETE — all 29 entries in the manifest.** 27 proven install+uninstall on real machines; still to bench on suitable hardware: ConnectWise Automate Agent (needs an expendable non-WSTEST001 box + consumes an Automate seat per install), Acrobat Pro (needs a machine where a licensed user can sign in), Cisco Secure Client (bundle is v1-production-proven; v2 wrapper untested). Not yet pushed to GitHub; local testing via AppsDeploy-Test.bat.
+It replaced the v1 Apps-Deploy-Menu as part of the deployment overhaul: OSDCloud now handles imaging and baseline agents, Intune handles user-driven apps, and AppsDeploy covers everything a tech applies by hand.
 
-## Files (Scripts/AppsDeploy2/)
-- **AppsDeploy.bat** — production launcher: unblocks MOTW, elevates, downloads the latest three .ps1 from the repo into `C:\ProgramData\RWW\AppsDeploy\App\`, runs from there (all-or-nothing `.new` staging; falls back to the previous copy with a warning if GitHub is unreachable).
-- **AppsDeploy-Test.bat** — local-test launcher: runs the .ps1 files in its own folder, no GitHub; stamps "(LOCAL TEST MODE)"; test logs to `AppsDeployTest\Logs`; console pauses only on non-zero exit.
-- **AppsDeploy-UI.ps1** — WPF UI process (Frutiger Aero). Does no install work; minimizes then DETACHES from its console at startup; runs ALL native exes (net.exe, taskkill.exe) windowless via Invoke-HiddenExe — a console-less process otherwise spawns a visible console window per child (confirmed).
-- **AppsDeploy-Worker.ps1** — plain console PowerShell process; executes the job plan; only contract with the UI is the run log.
-- **AppsDeploy-Manifest.ps1** — shared app manifest, dot-sourced by both processes.
+## Running it
 
-## Core decisions (and why)
-1. **Two processes, log-file contract.** v1's progress window froze under install load. v2 shares nothing between UI and work — the freeze class is impossible by construction. Logs: `C:\ProgramData\RWW\AppsDeploy\Logs\AppsDeploy_<stamp>.log` (+ `.job.json`). Machine lines `::STEP::/::RESULT::/::DONE::` (actions Install|Uninstall|Update) drive the UI header; human lines colorized. 3-second grace window after worker exit before declaring it dead (DONE-write vs exit race, confirmed).
-2. **Desired-state checkboxes; detection is ground truth.** Detect runs on open, after every run, and via the banner's **Rescan button** (feedback is timer-phased: the click handler only dims/relabels and returns so WPF paints, a timer does the scan — a forced render pump inside the handler CRASHED the whole app, confirmed; no dispatcher pumping in handlers, ever). Worker re-detects before each step (skip) and after (verdict). Uninstall verification polls up to 120 s (respawning uninstallers; Logi's took ~70 s). Detection-over-exit-codes also saves false failures forward: Logi exits 1008 on success; ZAC's v1-era "chronic failures" were the same class of exit-code lies — both verify fine by detection.
-3. **One engine per action — no fallbacks (Aaron's call).** Engines: `Winget` (`--scope machine` unless `MachineScope = $false`; HRESULT hints; one source-update retry), `Msi` (direct URL, streamed download), `MsiRegistry` (DisplayNameLike lookup OR exact `ProductCode` — added for Acrobat Pro, whose name collides with Reader), `Registry` (tiered; Inno recognized FIRST and forced to `/VERYSILENT` — Inno quiet strings are `/SILENT` and show a window), `Odt` (below), `Custom` (runs in worker scope; `$Context` = Interactive, Log, StageDir, Variant). Interactive toggle is the only fallback story.
-4. **Odt engine (Office family).** setup.exe staged from the private share (`\\svazdfs001\systems$\Software\Microsoft\Office\MSOffice`, IP fallback); config XML GENERATED minimal per product (one product; Language pinned en-us); Display None/Full; product-specific `<Remove>`. **Uninstalls reuse the locally cached odt-setup.exe — no share, no credentials.** 90-min budget. **Heartbeat:** a probe reports Click-to-Run's disk footprint every 30 s and WARNs after 120 s of no growth (stuck-scenario signature). Invoke-ProcessStep takes optional `-ProgressProbe` for silent children generally.
-5. **Installer-share gate (plan-driven, just-in-time).** Share-needing steps (Odt installs; Custom specs with `NeedsShare`) get a grey row tag and a confirm-dialog line. After confirm: TCP-445 probe (2 s cap/host), silent access check (domain-joined techs sail through), then an Aero credential dialog (pre-filled `RPSINC\`), non-persistent `net use` inherited by the worker; dropped at app exit; credentials never persisted. Specs can name `SkipShareIfPresent = <local file>` (cached tools make the share unnecessary). Winget-only plans never see any of it.
-6. **Cancel = kill the worker's process tree**, confirm first; sweep of the one in-flight app streams into the window. Cancelled UPDATE → repair reinstall. **ODT special-case (confirmed twice):** the Click-to-Run SERVICE keeps installing after setup.exe dies, and early on nothing is registered — so the sweep stops ClickToRunSvc + kills its processes UNCONDITIONALLY before any detection check, then Removes if registered.
-7. **Liveness:** crisp dot + blurred halo cycling blue/grey/green (solid green/red at end), `m:ss elapsed | last output Ns ago` ticker, live child-output relay (1 s, stateful UTF-8 reader, bar lines dropped), streamed downloads with MB/percent lines.
-8. **Timers:** completion bar countdown (10 min silence = Yes, back to menu); 30-min visible menu idle timer. **Update feature:** "Update installed apps" button; `winget upgrade --include-unknown` per installed winget-managed app; 0x8A15002B = "Already up to date", passes; self-updaters and static packages skipped by name.
-9. **Variant dropdowns (built for the Automate agent).** A manifest entry with a `Variants` block gets a ComboBox on its row: `Default` + `Seed` list shown always; additional choices DISCOVERED from the share folder's subdirectory names (`DiscoverFrom`, minus `Exclude`), auto-merged whenever share access appears (after the credential gate, on Rescan, on every return to the menu). The choice rides the job file to Custom scripts as `$Context.Variant` and shows in the confirm dialog.
-10. **SYSTEM/Backstage:** quser confirmation before uninstalls with users on; MSIX not installable as SYSTEM (fails visibly).
-11. **No Terminal-hostable console:** UI minimizes (launcher-owned console) then FreeConsole; worker + sweep run CREATE_NO_WINDOW. Uninstalling Windows Terminal through the tool used to kill the tool.
-12. **Closure-scoping rule:** no `$script:` inside GetNewClosure blocks (build-time audit); `$PSScriptRoot` unreliable in param() defaults.
+Run `AppsDeploy.bat` from `rww-installers/Scripts/AppsDeploy2/`. It elevates itself, downloads the latest scripts from GitHub into `%TEMP%`, and launches. The bat works standalone (e.g. from the Automate Shared Toolbox), and because it always pulls from GitHub, updating the repo updates every machine. If GitHub is unreachable it runs the last downloaded copy and says so.
 
-## MSIX pattern (Windows Terminal, Windows App, Claude)
-Detect `Get-AppxPackage -AllUsers` exactly (never loose wildcards — `*WindowsApp*` hits WindowsAppRuntime); install winget per-user (`MachineScope = $false`); Terminal's install adds a 15 s watch that closes its post-install auto-launch; uninstall Custom: `Remove-AppxPackage -AllUsers` (+ de-provision). **Claude:** Anthropic's official method — evergreen MSIX (`https://claude.ai/api/desktop/win32/<arch>/msix/latest/redirect`) + `Add-AppxProvisionedPackage`; self-updates; Cowork needs Virtual Machine Platform. Deferred: Windows App taskbar pin via Default-profile LayoutModification.xml (built, reverted v29).
+Logs: `C:\ProgramData\RWW\AppsDeploy\Logs\` — one log plus the job plan per run.
 
-## Vendor five — port notes (all entries live as of v63)
-- **ConnectWise Automate Agent:** Site variant dropdown (21 sites seeded; discovered from `\\svazdfs001\systems$\Software\ConnectWise\AllConnectWiseAgents\<Site>\`, `Uninstaller` excluded). Install = that site's `Agent_Install.msi` + `Agent_Install.mst` (TRANSFORMS carries the site binding). Detect = LTService service. Uninstall = the share's GENERIC `Uninstaller\Uninstall.exe`, cached locally at install time (share-free removals via `SkipShareIfPresent`). CAUTIONS: Backstage uninstall cuts your own session; each install consumes an Automate seat — retire the console record to reclaim; UNTESTED pending an expendable box.
-- **ZAC:** winget `Zultys.ZAC` — Zultys maintains the manifest same-day from mirror.zultys.biz, so winget = always-newest with hash verification. ARP is exactly 'ZAC', MSI-registered → MsiRegistry uninstall. Proven both ways in one try.
-- **MXAdmin:** downloads from RANDYS' OWN MX (`https://randysww.mxvirtual.com/admin_setup.exe`) — every MX serves the MXAdmin matching its own release, so this is self-updating AND version-correct (a googleable third-party MX like zultys.winco.com.hk was rejected: wrong trust, wrong version). MZ/size validation before running; Inno both ways ('MXAdmin version X' ARP; its `unins000.exe` under `Program Files (x86)\Zultys` is the one that confused v1's ZAC work). Proven both ways.
-- **Cisco Secure Client (VPN, core only — Umbrella lapsed):** wraps RWW's own prebuilt SecureConnect SFX bundle from `\\svazdfs001\systems$\Software\CiscoSecureClient\SecureConnect-VPN-Install.exe` (private SecureConnect repo artifact: silent msiexec with 1618 retry + RWW VPN profile drop + csc_vpnagent restart; its logs land in `C:\Windows\Logs\SecureConnect-OnDemand*.log`). Detection = PRESENCE (profile XML + service exists), deliberately not v1's service-RUNNING health check, which would misread stopped-as-uninstalled. Uninstall = MsiRegistry on 'Cisco Secure Client - AnyConnect VPN*' (precise: every Cisco module registers a similar name).
-- **Acrobat Pro:** winget `Adobe.Acrobat.Pro` + named-user sign-in (assumption Aaron hasn't contradicted; no Admin Console package hosted). GUID-keyed: Pro = `{AC76BA86-1033-FFFF-7760-BC15014EA700}` (confirmed on a licensed machine), Reader MUI = `{...FF00...}` — same ARP display name, so detection AND uninstall go by ProductCode.
+## The pieces
 
-## App identity field notes
-- Exact-match where families collide: Git is exactly 'Git'; 'Logi Options+*' never 'Logitech Options*'; Windows App = `MicrosoftCorporationII.Windows365`/`.WindowsApp` exactly; ZAC exactly 'ZAC'.
-- VC++ unified runtime renamed to 'Microsoft Visual C++ **v14** Redistributable' (old '2015-2022' naming also accepted). One checkbox = 2010/2012/2013/2015+ × x64/x86; 2005/2008 excluded as EOL; loop omits `--scope machine`.
-- .NET Desktop Runtime: version-10-specific; DCU's winget manifest pulls .NET 8 alongside — expected. Java: Temurin JRE 25. Node.js: LTS. Firefox: Registry-engine uninstall (winget's "silent" uninstall opens the full wizard — same class as VLC).
-- Office detection: O365 '*Microsoft 365 Apps*'; 2021 '*Office LTSC*2021*' (v1's contiguous pattern never matched — latent v1 bug); Project/Visio '*Microsoft Project*'/'*Microsoft Visio*'; Outlook Classic '*Microsoft Outlook*' (standalone-only). **OutlookRetail confirmed** as the ODT product for standalone classic Outlook.
+- **AppsDeploy.bat** — launcher: elevate, download, run.
+- **AppsDeploy-UI.ps1** — the menu and progress window. Never installs anything itself.
+- **AppsDeploy-Worker.ps1** — a separate process that does the actual work.
+- **AppsDeploy-Manifest.ps1** — the app catalog: how to detect, install, and uninstall each app, plus the role profiles. **To add an app or a role profile, edit only this file** — a new entry automatically gets the wrench, detection, cancel cleanup, share gating, and console mode.
 
-## winget field notes
-- WSWA1ITG070: winget broken machine-wide (0x8A15000F); `winget source reset --force` recommended.
-- winget's "silent" uninstalls are untrustworthy for NSIS/Inno apps (VLC, VS Code, Firefox) → **pattern: winget installs, Registry-engine uninstalls** for NSIS/Inno vendors.
-- winget auto-resolves manifest dependencies (VC++ before Logi; .NET 8 before DCU).
-- Office/C2R: a force-killed scenario leaves a leftover OfficeClickToRun.exe holding the scenario lock — the NEXT ODT run waits forever at 0% CPU (confirmed: 14 silent minutes). Reboot clears it; the heartbeat names it.
+## The four design rules
 
-## Manifest roster — 29 entries
-Utilities: 7-Zip · VLC · Windows Terminal · Windows App · Logi Options+ · Claude · Adobe Acrobat Reader · Adobe Acrobat Pro · Dell Command Update. Browsers: Chrome · Firefox. Development: VS Code · Git · GitHub CLI · Node.js (LTS). Runtimes: VC++ Redistributables (×8) · .NET Desktop Runtime 10 · Java (Temurin JRE 25). Microsoft Office: Office (Microsoft 365) · Office Suite 2021 · Project Professional 2021 · Visio Professional 2021 · Outlook Classic. Communications: ZAC · MXAdmin. Agents: ConnectWise Automate Agent · Cisco Secure Client (VPN).
+**1. The UI and the worker are separate processes.** In v1, installs ran inside the GUI process and heavy installers froze the window. In v2 the UI writes a job file, launches the worker, and just tails its log. They share nothing else, so the GUI cannot freeze no matter what an installer does.
 
+**2. Detection is the truth, not exit codes.** Installers lie — Logi Options+ returns an "error" code on success, and ZAC's v1 "chronic failures" were actually successes. So every app has a detection check (is it really installed?). The worker detects before each step (skip if already done) and after (that result, not the exit code, decides pass/fail). The menu checkboxes always show what's actually on the machine.
+
+**3. One install method per app, no automatic fallbacks.** An early build tried a second method when the first failed. That made failures ambiguous and the code hard to trust, so it was removed: each app has exactly one silent install method and one uninstall method, which works or fails clearly in the log. If an app keeps failing silently, the tech lights its **wrench** (below) to get the vendor's normal wizard — the only fallback, and a visible per-app human choice.
+
+**4. Cancel cleans up after itself.** Cancel kills the worker and then sweeps the one app that was mid-flight: a cancelled install gets uninstalled, a cancelled update or repair gets a repair reinstall. (Office is special — see below.)
+
+## The wrench (interactive runs and repairs)
+
+Every row has a wrench-and-gear toggle at its far right edge, shown whenever the app is installed or checked to be installed. Lit (green), it means **"show the vendor's own installer window for this app instead of running silently"**, and what that does follows from the row's state:
+
+- Checked but not installed → an **interactive install** (the vendor's setup wizard).
+- Unchecked but installed → an **interactive uninstall**.
+- Installed and staying installed → queues a **Repair**: the installer runs again over the existing install, and the vendor's setup opens with its own Repair/Modify options.
+
+Interactivity is per app, not per run, so one Proceed can mix silent installs with an interactive repair. Repairs are verified by detection like everything else, and a repair of a share-based app needs the share just like its install does. In Backstage's console mode, repairs exist too (`E <num>`) but always run silently — a vendor window on a hidden desktop would be invisible and hang the run.
+
+## Install methods (engines)
+
+Each manifest entry names one engine for install and one for uninstall (a repair re-runs the install engine over the top — the standard repair for MSI-based installers; winget gets `--force`):
+
+| Engine | What it does |
+|---|---|
+| Winget | Installs from winget, machine-scope where supported. |
+| Msi | Downloads an MSI from a URL and installs silently. |
+| MsiRegistry | Uninstalls via `msiexec /x` using the app's registry entry (by name or exact ProductCode). |
+| Registry | Uninstalls non-MSI apps via their own registered uninstaller with the right silent switches. |
+| Odt | Microsoft Office, via the Office Deployment Tool. |
+| Custom | A script in the manifest, for anything the above can't express. It receives the action (Install/Repair), interactivity, and any variant choice. |
+
+**Key pattern:** winget *installs* are reliable, but its "silent" *uninstalls* often pop the vendor's full wizard (VLC, VS Code, Firefox). Those apps install with Winget and uninstall with Registry.
+
+## Office
+
+Office products install via the ODT `setup.exe` from the software share, with a minimal config generated on the fly (one product, en-US). Each product (M365 Apps, Office 2021, Project, Visio, standalone Outlook) is its own menu entry. Installs are slow and silent, so the log reports Click-to-Run's disk usage every 30 seconds and warns if it stalls.
+
+Two things to know:
+- **Uninstalls never need the share** — setup.exe is cached locally at install time.
+- **Cancelling Office:** the Click-to-Run *service* keeps installing after setup.exe dies, so the cancel sweep stops the service first. And if a C2R install is ever force-killed outside the tool, a leftover process can hang the *next* Office install at 0% CPU — reboot to clear it.
+
+## The network share
+
+Apps installed from `\\svazdfs001\systems$` are tagged "(uses network share)" in the menu. The tool only asks for credentials when the selected plan actually needs the share, tries silent access first (domain-joined techs usually sail through), and pre-fills `RPSINC\` in the prompt. The connection is temporary and credentials are never saved. A winget-only plan never sees any of this.
+
+## Menu features
+
+- **Categories** in deployment order (Runtimes → Agents → Office → Communications → Browsers → Utilities → Development), alphabetical within.
+- **Profiles** — "Standard" and "Developer" pre-check a known-good app set on top of whatever's installed. Profiles never uncheck or uninstall anything. Lists live in the manifest; a new role for deployment = a new profile there (a name plus a list of app names).
+- **Rescan** — re-detect everything on demand.
+- **Update installed apps** — `winget upgrade` across winget-managed apps; self-updaters (Chrome, Claude) skipped.
+- **Site dropdown** on the ConnectWise agent row (inboard of the wrench) — picks which client site the agent binds to. Proceeding with the default "New PCs" still selected asks for confirmation, because installing an agent under the wrong site is an easy mistake. The choice also rides a repair.
+- **Liveness** — a status dot, an elapsed/last-output ticker, and streamed installer output, so a quiet log never leaves you guessing whether it's alive.
+
+## Backstage
+
+WPF can't render on hidden desktops — Backstage gets a black window, full stop. So the UI detects its desktop and, outside a normal session, presents the same tool as a **text menu**: same manifest, same worker, same logs, same confirmations, plus silent repairs via `E <num>`. Only limitation: no mid-run cancel. Also note: MSIX apps can't install as SYSTEM (fails with a clear message), and uninstalls warn if users are logged on.
+
+## App quick reference
+
+| App | Notes |
+|---|---|
+| ConnectWise Automate agent | Site MSI + MST transform from the share (the MST binds the site). Detect = LTService. Uninstall = ConnectWise's generic uninstaller, cached at install time. **Each install consumes an Automate seat — retire the old console record. Backstage uninstall cuts your own session.** |
+| Cisco Secure Client | VPN module only (Umbrella lapsed). Our prebuilt silent bundle from the share. Detect = profile XML + service *exists* (not running — a stopped service isn't "uninstalled"). |
+| Acrobat Reader / Pro | Same display name in Add/Remove, so both are keyed by ProductCode (Pro = `...FFFF...`, Reader = `...FF00...`). Pro needs no license to install; users sign in on their own profile. |
+| MXAdmin | Downloads from **our own** MX (`randysww.mxvirtual.com`) — each MX serves its matching MXAdmin version. Never use a third-party MX found by search. |
+| ZAC | winget (Zultys keeps the manifest current). ARP name is exactly 'ZAC'. |
+| MSIX apps (Terminal, Windows App, Claude) | Detect by exact package name (`-AllUsers`); loose wildcards match the wrong packages. Per-user winget install; uninstall removes + de-provisions. Terminal's auto-launch after install gets auto-closed (skipped on repairs — a running Terminal could be the tech's own). Claude uses Anthropic's evergreen MSIX URL and self-updates, so re-provisioning the same version on a repair is refused by Windows — logged as a warning, not a failure. |
+| VC++ Redistributables | One checkbox = 2010/2012/2013/2015+ × both architectures. Microsoft renamed "2015-2022" to "v14" in new builds; detection accepts both. |
+| Office 2021 | Detect string is `*Office LTSC*2021*` — v1's pattern never matched (latent bug). |
+| winget itself | If broken machine-wide (0x8A15000F): `winget source reset --force`. |
+
+Full details for every app are in the manifest.
+
+## For maintainers — pitfalls baked into the code
+
+These each cost real debugging time; don't reintroduce them.
+
+- Never do work or force rendering inside a WPF event handler — handlers return immediately and a timer does the work. Pumping the dispatcher in a handler crashes the app.
+- No `$script:` variables inside `GetNewClosure()` blocks — they silently become `$null`.
+- Sort hashtables with `Sort-Object { $_.Name }`, never `-Property Name` (returns nulls, then PS 5.1's unstable sort scrambles the order).
+- The UI detaches from its console and launches every native exe windowless — otherwise each child spawns a visible console window, and uninstalling Windows Terminal (the default console host on Win11) would kill the tool itself.
+- The UI waits 3 seconds after the worker exits before reading the verdict — the final log write can race the exit.
+- The wrench icon is vector path data in the UI (same grammar as SVG paths), so the scripts stay pure ASCII — no image files, no Unicode glyphs.
+
+## Status
+
+The GUI/feature set is considered settled for now; the roster will keep growing as more roles come up for deployment (new apps = manifest entries, new roles = profiles). All 27 apps proven on real machines except the ConnectWise agent (needs an expendable test box — each install burns a seat). Remaining: push the current wrench/repair build to GitHub (the repo still holds the pre-repair version), run the bat from the Automate Toolbox end-to-end once, bench the CW agent, pilot, then decommission v1.
 ## Next steps
 - Bench the last three on suitable hardware: CW Automate Agent (expendable box; seat consumed per install), Acrobat Pro (licensed sign-in machine; also the Reader+Pro coexistence check), Cisco Secure Client wrapper.
 - Push `Scripts/AppsDeploy2/` to main when ready; production .bat already points there. Then production pilot.
